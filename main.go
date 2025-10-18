@@ -384,46 +384,19 @@ func (p *Proxy) handleConnection(conn net.Conn) {
 		p.handleDirectConnection(conn, reader)
 	}
 }
-// in handleHTTPPayloadConnection
-// ############ 修正点 2: 使用自定义 Header "X-Device-ID" 进行认证 ############
-credential := req.Header.Get("X-Device-ID")
-if credential == "" {
-    p.Print("[!] Auth Failed: Missing 'X-Device-ID' header from %s", remoteIP)
-    sendHTTPErrorAndClose(conn, http.StatusUnauthorized, "Unauthorized", "Missing Credentials")
-    return
-}
 // ==========================================================
 // --- 3. 协议处理器和核心转发逻辑 ---
 // ==========================================================
 
-func (p *Proxy) handleTLSConnection(conn net.Conn, reader *bufio.Reader) {
-	if p.tlsConfig == nil {
-		p.Print("[!] TLS connection from %s rejected: TLS not configured", conn.RemoteAddr())
-		return
-	}
-	tlsConn := tls.Server(conn, p.tlsConfig)
-
-	err := tlsConn.SetReadDeadline(time.Now().Add(time.Duration(p.cfg.Settings.HandshakeTimeout) * time.Second))
-	if err != nil {
-		p.Print("[!] Failed to set TLS handshake deadline for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	if err := tlsConn.Handshake(); err != nil {
-		if err != io.EOF && !strings.Contains(err.Error(), "read: connection reset by peer") {
-			p.Print("[!] TLS handshake error from %s: %v", conn.RemoteAddr(), err)
-		}
-		return
-	}
-	tlsConn.SetReadDeadline(time.Time{})
-
-	p.handleHTTPPayloadConnection(tlsConn, bufio.NewReader(tlsConn))
-}
-
+// ===================== 完整的、修正后的函数 =====================
 func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	connKey := fmt.Sprintf("%s-%d", remoteIP, time.Now().UnixNano())
-	_, cancel := context.WithCancel(p.ctx)
-	defer cancel()
+
+	// 注意：这里的 context cancel 逻辑在您最新的代码里被移除了，
+	// 如果需要优雅关闭单个连接，可以重新引入。
+	// _, cancel := context.WithCancel(p.ctx)
+	// defer cancel()
 
 	connInfo := &ActiveConnInfo{
 		conn:            conn,
@@ -433,7 +406,7 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		status:          "握手",
 		firstConnection: time.Now(),
 		lastActive:      time.Now().Unix(),
-		cancel:          cancel,
+		// cancel:          cancel,
 	}
 	p.AddActiveConn(connKey, connInfo)
 	defer p.RemoveActiveConn(connKey)
@@ -447,7 +420,6 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			// ############ 修正点 1: 增加详细错误日志 ############
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				p.Print("[!] Handshake timeout for %s", remoteIP)
 			} else if err != io.EOF {
@@ -470,8 +442,8 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		req.Body.Close()
 		initialData = body
 
+		// --- ↓↓↓ 这里是需要插入/替换的认证逻辑 ↓↓↓ ---
 		if p.cfg.Settings.EnableAuth {
-			// ############ 修正点 2: 使用自定义 Header "X-Device-ID" 进行认证 ############
 			credential := req.Header.Get("X-Device-ID")
 			if credential == "" {
 				p.Print("[!] Auth Failed: Missing 'X-Device-ID' header from %s", remoteIP)
@@ -505,6 +477,7 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 			connInfo.credential = credential
 			connInfo.mu.Unlock()
 		}
+		// --- ↑↑↑ 认证逻辑结束 ↑↑↑ ---
 
 		ua := req.UserAgent()
 		if p.cfg.Settings.UAKeywordProbe != "" && strings.Contains(ua, p.cfg.Settings.UAKeywordProbe) {
@@ -526,29 +499,6 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 
 	conn.SetReadDeadline(time.Time{})
 	p.forwardToTarget(conn, reader, connInfo, headersText, initialData)
-}
-
-func (p *Proxy) handleDirectConnection(conn net.Conn, reader *bufio.Reader) {
-	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	connKey := fmt.Sprintf("%s-%d", remoteIP, time.Now().UnixNano())
-	_, cancel := context.WithCancel(p.ctx)
-	defer cancel()
-
-	connInfo := &ActiveConnInfo{
-		conn:            conn,
-		connKey:         connKey,
-		ip:              remoteIP,
-		protocol:        "Direct TCP",
-		status:          "直连",
-		firstConnection: time.Now(),
-		lastActive:      time.Now().Unix(),
-		cancel:          cancel,
-		deviceID:        "Direct TCP Connection",
-	}
-	p.AddActiveConn(connKey, connInfo)
-	defer p.RemoveActiveConn(connKey)
-
-	p.forwardToTarget(conn, reader, connInfo, "", nil)
 }
 
 func (p *Proxy) forwardToTarget(clientConn net.Conn, clientReader io.Reader, connInfo *ActiveConnInfo, headersText string, initialData []byte) {
