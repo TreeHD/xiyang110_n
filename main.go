@@ -437,6 +437,9 @@ func (p *Proxy) handleTLSConnection(conn net.Conn, reader *bufio.Reader) {
 	p.handleHTTPPayloadConnection(tlsConn, bufio.NewReader(tlsConn))
 }
 
+// ##################################################################
+// ####################    MODIFICATION START    ####################
+// ##################################################################
 func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	connKey := fmt.Sprintf("%s-%d", remoteIP, time.Now().UnixNano())
@@ -484,40 +487,21 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		req.Body.Close()
 		initialData = body
 
-		if p.cfg.Settings.EnableAuth {
-			credential := req.Header.Get("X-Device-ID")
-			if credential == "" {
-				p.Print("[!] Auth Failed: Missing 'X-Device-ID' header from %s", remoteIP)
-				sendHTTPErrorAndClose(conn, http.StatusUnauthorized, "Unauthorized", "Missing Credentials")
-				return
-			}
-
-			p.cfg.lock.RLock()
-			deviceInfo, found := p.cfg.DeviceIDs[credential]
-			p.cfg.lock.RUnlock()
-
-			if !found {
-				p.Print("[!] Auth Failed: Invalid 'X-Device-ID' [%s] from %s", credential, remoteIP)
-				sendHTTPErrorAndClose(conn, http.StatusUnauthorized, "Unauthorized", "Invalid Credentials")
-				return
-			}
-			if !deviceInfo.Enabled {
-				p.Print("[!] Auth Failed: Device '%s' is disabled for %s", deviceInfo.FriendlyName, remoteIP)
-				sendHTTPErrorAndClose(conn, http.StatusForbidden, "Forbidden", "账号被禁止,请联系管理员解锁")
-				return
-			}
-			expiry, err := time.Parse("2006-01-02", deviceInfo.Expiry)
-			if err != nil || time.Now().After(expiry.Add(24*time.Hour)) {
-				p.Print("[!] Auth Failed: Device '%s' has expired for %s", deviceInfo.FriendlyName, remoteIP)
-				sendHTTPErrorAndClose(conn, http.StatusForbidden, "Forbidden", "账号已到期，请联系管理员充值")
-				return
-			}
-
-			connInfo.mu.Lock()
-			connInfo.deviceID = deviceInfo.FriendlyName
-			connInfo.credential = credential
-			connInfo.mu.Unlock()
-		}
+		// ======================================================================
+		// --- AUTHENTICATION DISABLED FOR TESTING ---
+		// The original authentication block has been commented out.
+		// A default device ID is assigned for logging purposes.
+		//
+		// if p.cfg.Settings.EnableAuth {
+		// 	credential := req.Header.Get("X-Device-ID")
+		// 	... (full authentication logic here) ...
+		// }
+		//
+		connInfo.mu.Lock()
+		connInfo.deviceID = fmt.Sprintf("Unauthenticated-%s", remoteIP)
+		connInfo.mu.Unlock()
+		// --- END OF DISABLED AUTHENTICATION ---
+		// ======================================================================
 
 		ua := req.UserAgent()
 		if p.cfg.Settings.UAKeywordProbe != "" && strings.Contains(ua, p.cfg.Settings.UAKeywordProbe) {
@@ -540,6 +524,9 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 	conn.SetReadDeadline(time.Time{})
 	p.forwardToTarget(conn, reader, connInfo, headersText, initialData)
 }
+// ##################################################################
+// ####################     MODIFICATION END     ####################
+// ##################################################################
 
 func (p *Proxy) handleDirectConnection(conn net.Conn, reader *bufio.Reader) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
