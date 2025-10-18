@@ -32,7 +32,7 @@ import (
 )
 
 // ==========================================================
-// --- 1. 配置与结构体定义 (现代化架构) ---修正错误
+// --- 1. 配置与结构体定义 ---
 // ==========================================================
 
 const ConfigFile = "ws_config.json"
@@ -149,6 +149,7 @@ type RingBuffer struct {
 func NewRingBuffer(capacity int) *RingBuffer {
 	return &RingBuffer{buffer: make([]string, capacity)}
 }
+
 func (rb *RingBuffer) Add(msg string) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -157,18 +158,17 @@ func (rb *RingBuffer) Add(msg string) {
 	rb.head = (rb.head + 1) % len(rb.buffer)
 	fmt.Println(logLine)
 }
+
 func (rb *RingBuffer) GetLogs() []string {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
-	var logs []string
-	for i := 0; i < len(rb.buffer); i++ {
-		idx := (rb.head + i) % len(rb.buffer)
+	cap := len(rb.buffer)
+	logs := make([]string, 0, cap)
+	for i := 1; i <= cap; i++ {
+		idx := (rb.head - i + cap) % cap
 		if rb.buffer[idx] != "" {
 			logs = append(logs, rb.buffer[idx])
 		}
-	}
-	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
-		logs[i], logs[j] = logs[j], logs[i]
 	}
 	return logs
 }
@@ -233,6 +233,7 @@ func LoadConfig() (*Config, error) {
 	}
 	return cfg, nil
 }
+
 // ==========================================================
 // --- 2. Proxy 核心实现 (生命周期, 监听, 协议嗅探) ---
 // ==========================================================
@@ -349,7 +350,14 @@ func (p *Proxy) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-	// ... IP 黑白名单检查 ...
+	if p.cfg.Settings.EnableIPBlacklist && isIPInList(remoteIP, p.cfg.Settings.IPBlacklist) {
+		p.Print("[-] Connection from blacklisted IP %s rejected.", remoteIP)
+		return
+	}
+	if p.cfg.Settings.EnableIPWhitelist && !isIPInList(remoteIP, p.cfg.Settings.IPWhitelist) {
+		p.Print("[-] Connection from non-whitelisted IP %s rejected.", remoteIP)
+		return
+	}
 
 	p.Print("[+] Connection opened from %s", remoteIP)
 
@@ -357,24 +365,17 @@ func (p *Proxy) handleConnection(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(timeout))
 
 	reader := bufio.NewReader(conn)
-	// ===================== 修正点 =====================
-	_, err := reader.Peek(p.cfg.Settings.HandshakePeek)
+	peekedBytes, err := reader.Peek(p.cfg.Settings.HandshakePeek)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			p.Print("[-] Handshake timeout for %s after %v", remoteIP, timeout)
 		} else if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-			// 记录其他非预期的 Peek 错误
 			p.Print("[!] Handshake peek error from %s: %v", remoteIP, err)
 		}
-		// 如果 Peek 失败（无论何种原因），就直接返回，不再继续处理
 		return
 	}
-	// ================================================
-	
-	// 如果 Peek 成功，再读取真实数据
-	peekedBytes, _ := reader.Peek(p.cfg.Settings.HandshakePeek) // 此时不会再报错
 
-	conn.SetReadDeadline(time.Time{}) // 清除超时设置
+	conn.SetReadDeadline(time.Time{})
 
 	if isTLS(peekedBytes) {
 		p.handleTLSConnection(conn, reader)
@@ -384,19 +385,61 @@ func (p *Proxy) handleConnection(conn net.Conn) {
 		p.handleDirectConnection(conn, reader)
 	}
 }
+
+func (p *Proxy) acquire() bool {
+	select {
+	case p.connSemaphore <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Proxy) release() {
+	<-p.connSemaphore
+}
+
+func isTLS(peekedBytes []byte) bool {
+	return len(peekedBytes) > 5 && peekedBytes[0] == 0x16 && peekedBytes[1] == 0x03
+}
+
+func isHTTP(peekedBytes []byte) bool {
+	s := string(peekedBytes)
+	return strings.HasPrefix(s, "GET ") || strings.HasPrefix(s, "POST ") ||
+		strings.HasPrefix(s, "PUT ") || strings.HasPrefix(s, "HEAD ") ||
+		strings.HasPrefix(s, "OPTIONS ") || strings.HasPrefix(s, "DELETE ")
+}
+
 // ==========================================================
 // --- 3. 协议处理器和核心转发逻辑 ---
 // ==========================================================
 
-// ===================== 完整的、修正后的函数 =====================
+func (p *Proxy) handleTLSConnection(conn net.Conn, reader *bufio.Reader) {
+	if p.tlsConfig == nil {
+		p.Print("[!] TLS connection from %s rejected: TLS not configured", conn.RemoteAddr())
+		return
+	}
+	tlsConn := tls.Server(conn, p.tlsConfig)
+
+	err := tlsConn.SetReadDeadline(time.Now().Add(time.Duration(p.cfg.Settings.HandshakeTimeout) * time.Second))
+	if err != nil {
+		p.Print("[!] Failed to set TLS handshake deadline for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		if err != io.EOF && !strings.Contains(err.Error(), "read: connection reset by peer") {
+			p.Print("[!] TLS handshake error from %s: %v", conn.RemoteAddr(), err)
+		}
+		return
+	}
+	tlsConn.SetReadDeadline(time.Time{})
+
+	p.handleHTTPPayloadConnection(tlsConn, bufio.NewReader(tlsConn))
+}
+
 func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader) {
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	connKey := fmt.Sprintf("%s-%d", remoteIP, time.Now().UnixNano())
-
-	// 注意：这里的 context cancel 逻辑在您最新的代码里被移除了，
-	// 如果需要优雅关闭单个连接，可以重新引入。
-	// _, cancel := context.WithCancel(p.ctx)
-	// defer cancel()
 
 	connInfo := &ActiveConnInfo{
 		conn:            conn,
@@ -406,7 +449,6 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		status:          "握手",
 		firstConnection: time.Now(),
 		lastActive:      time.Now().Unix(),
-		// cancel:          cancel,
 	}
 	p.AddActiveConn(connKey, connInfo)
 	defer p.RemoveActiveConn(connKey)
@@ -442,7 +484,6 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 		req.Body.Close()
 		initialData = body
 
-		// --- ↓↓↓ 这里是需要插入/替换的认证逻辑 ↓↓↓ ---
 		if p.cfg.Settings.EnableAuth {
 			credential := req.Header.Get("X-Device-ID")
 			if credential == "" {
@@ -477,7 +518,6 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 			connInfo.credential = credential
 			connInfo.mu.Unlock()
 		}
-		// --- ↑↑↑ 认证逻辑结束 ↑↑↑ ---
 
 		ua := req.UserAgent()
 		if p.cfg.Settings.UAKeywordProbe != "" && strings.Contains(ua, p.cfg.Settings.UAKeywordProbe) {
@@ -499,6 +539,26 @@ func (p *Proxy) handleHTTPPayloadConnection(conn net.Conn, reader *bufio.Reader)
 
 	conn.SetReadDeadline(time.Time{})
 	p.forwardToTarget(conn, reader, connInfo, headersText, initialData)
+}
+
+func (p *Proxy) handleDirectConnection(conn net.Conn, reader *bufio.Reader) {
+	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	connKey := fmt.Sprintf("%s-%d", remoteIP, time.Now().UnixNano())
+
+	connInfo := &ActiveConnInfo{
+		conn:            conn,
+		connKey:         connKey,
+		ip:              remoteIP,
+		protocol:        "Direct TCP",
+		status:          "直连",
+		firstConnection: time.Now(),
+		lastActive:      time.Now().Unix(),
+		deviceID:        "Direct TCP Connection",
+	}
+	p.AddActiveConn(connKey, connInfo)
+	defer p.RemoveActiveConn(connKey)
+
+	p.forwardToTarget(conn, reader, connInfo, "", nil)
 }
 
 func (p *Proxy) forwardToTarget(clientConn net.Conn, clientReader io.Reader, connInfo *ActiveConnInfo, headersText string, initialData []byte) {
@@ -565,6 +625,7 @@ func (p *Proxy) pipeTraffic(wg *sync.WaitGroup, dst net.Conn, src io.Reader, con
 		case <-p.ctx.Done():
 		default:
 			if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+				// Silently ignore pipe errors as they are expected when one side closes.
 			}
 		}
 	}
@@ -599,6 +660,7 @@ func (c *copyTracker) Write(p []byte) (n int, err error) {
 	}
 	return
 }
+
 // ==========================================================
 // --- 4. 辅助、API 和 Main 函数 ---
 // ==========================================================
@@ -611,21 +673,29 @@ func (p *Proxy) initMetrics() {
 		p.deviceUsage.Store(id, &newUsage)
 	}
 }
+
 func (p *Proxy) runPeriodicTasks() {
 	saveTicker := time.NewTicker(5 * time.Minute)
 	auditTicker := time.NewTicker(30 * time.Second)
 	statusTicker := time.NewTicker(2 * time.Second)
-	defer saveTicker.Stop(); defer auditTicker.Stop(); defer statusTicker.Stop()
+	defer saveTicker.Stop()
+	defer auditTicker.Stop()
+	defer statusTicker.Stop()
 
 	for {
 		select {
-		case <-saveTicker.C: p.saveDeviceUsage()
-		case <-auditTicker.C: p.auditActiveConnections()
-		case <-statusTicker.C: p.collectSystemStatus()
-		case <-p.ctx.Done(): return
+		case <-saveTicker.C:
+			p.saveDeviceUsage()
+		case <-auditTicker.C:
+			p.auditActiveConnections()
+		case <-statusTicker.C:
+			p.collectSystemStatus()
+		case <-p.ctx.Done():
+			return
 		}
 	}
 }
+
 func (p *Proxy) saveDeviceUsage() {
 	p.cfg.lock.Lock()
 	defer p.cfg.lock.Unlock()
@@ -643,9 +713,12 @@ func (p *Proxy) saveDeviceUsage() {
 		return true
 	})
 	if isDirty {
-		if err := p.cfg.SaveAtomic(); err != nil { p.Print("[!] Failed to save device usage: %v", err) }
+		if err := p.cfg.SaveAtomic(); err != nil {
+			p.Print("[!] Failed to save device usage: %v", err)
+		}
 	}
 }
+
 func (p *Proxy) auditActiveConnections() {
 	idleTimeout := time.Duration(p.cfg.Settings.IdleTimeout) * time.Second
 	p.conns.Range(func(key, value interface{}) bool {
@@ -658,111 +731,196 @@ func (p *Proxy) auditActiveConnections() {
 		return true
 	})
 }
+
 func (p *Proxy) collectSystemStatus() {
 	p.statusMutex.Lock()
 	defer p.statusMutex.Unlock()
 	var connCount int
-	p.conns.Range(func(k, v interface{}) bool { connCount++; return true })
+	p.conns.Range(func(k, v interface{}) bool {
+		connCount++
+		return true
+	})
 	cpuP, _ := cpu.Percent(0, false)
 	memP, _ := mem.VirtualMemory()
+
+	var cpuPercent float64
+	if len(cpuP) > 0 {
+		cpuPercent, _ = strconv.ParseFloat(fmt.Sprintf("%.1f", cpuP[0]), 64)
+	}
+	memPercent, _ := strconv.ParseFloat(fmt.Sprintf("%.1f", memP.UsedPercent), 64)
+
 	p.systemStatus = SystemStatus{
 		Uptime:        time.Since(p.startTime).Round(time.Second).String(),
-		CPUPercent:    cpuP[0],
-		MemPercent:    memP.UsedPercent,
+		CPUPercent:    cpuPercent,
+		MemPercent:    memPercent,
 		NumGoroutine:  runtime.NumGoroutine(),
 		ActiveConns:   connCount,
 		BytesSent:     formatBytes(atomic.LoadInt64(&p.globalBytesSent)),
 		BytesReceived: formatBytes(atomic.LoadInt64(&p.globalBytesReceived)),
 	}
 }
+
 func (p *Proxy) AddActiveConn(key string, conn *ActiveConnInfo) { p.conns.Store(key, conn) }
 func (p *Proxy) RemoveActiveConn(key string)                 { p.conns.Delete(key) }
 
+// --- API & Web Panel Section ---
+
 type APIConnectionResponse struct {
-	DeviceID string `json:"device_id"`; Status string `json:"status"`; Protocol string `json:"protocol"`
-	SentStr string `json:"sent_str"`; RcvdStr string `json:"rcvd_str"`; SpeedStr string `json:"speed_str"`
-	IP string `json:"ip"`; FirstConn string `json:"first_conn"`; LastActive string `json:"last_active"`
-	ConnKey string `json:"conn_key"`
+	DeviceID   string `json:"device_id"`
+	Status     string `json:"status"`
+	Protocol   string `json:"protocol"`
+	SentStr    string `json:"sent_str"`
+	RcvdStr    string `json:"rcvd_str"`
+	SpeedStr   string `json:"speed_str"`
+	IP         string `json:"ip"`
+	FirstConn  string `json:"first_conn"`
+	LastActive string `json:"last_active"`
+	ConnKey    string `json:"conn_key"`
 }
+
+type Session struct {
+	Username string
+	Expiry   time.Time
+}
+
+var (
+	adminPanelHTML, loginPanelHTML []byte
+	sessions                       = make(map[string]Session)
+	sessionsLock                   sync.RWMutex
+)
+
+const sessionCookieName = "wstunnel_session"
+
 func (p *Proxy) handleAPIConnections(w http.ResponseWriter, r *http.Request) {
 	var conns []*ActiveConnInfo
-	p.conns.Range(func(key, value interface{}) bool { conns = append(conns, value.(*ActiveConnInfo)); return true })
+	p.conns.Range(func(key, value interface{}) bool {
+		conns = append(conns, value.(*ActiveConnInfo))
+		return true
+	})
 	sort.Slice(conns, func(i, j int) bool { return conns[i].firstConnection.Before(conns[j].firstConnection) })
-	resp := []APIConnectionResponse{}
+
+	resp := make([]APIConnectionResponse, 0, len(conns))
 	now := time.Now()
 	for _, c := range conns {
 		c.mu.RLock()
 		status, protocol, deviceID, ip := c.status, c.protocol, c.deviceID, c.ip
 		firstConn, connKey := c.firstConnection, c.connKey
 		c.mu.RUnlock()
+
 		bytesSent, bytesReceived := atomic.LoadInt64(&c.bytesSent), atomic.LoadInt64(&c.bytesReceived)
 		if status == "活跃" {
 			if timeDelta := now.Sub(c.lastSpeedUpdateTime).Seconds(); timeDelta >= 2 {
 				currentTotalBytes := bytesSent + bytesReceived
 				bytesDelta := currentTotalBytes - c.lastTotalBytesForSpeed
-				if timeDelta > 0 { c.currentSpeedBps = float64(bytesDelta) / timeDelta }
-				c.lastSpeedUpdateTime = now; c.lastTotalBytesForSpeed = currentTotalBytes
+				if timeDelta > 0 {
+					c.currentSpeedBps = float64(bytesDelta) / timeDelta
+				}
+				c.lastSpeedUpdateTime = now
+				c.lastTotalBytesForSpeed = currentTotalBytes
 			}
 		}
 		resp = append(resp, APIConnectionResponse{
-			DeviceID: deviceID, Status: status, Protocol: protocol, SentStr: formatBytes(bytesSent),
-			RcvdStr: formatBytes(bytesReceived), SpeedStr: fmt.Sprintf("%s/s", formatBytes(int64(c.currentSpeedBps))),
-			IP: ip, FirstConn: firstConn.Format("15:04:05"),
-			LastActive: time.Unix(atomic.LoadInt64(&c.lastActive), 0).Format("15:04:05"), ConnKey: connKey,
+			DeviceID:   deviceID,
+			Status:     status,
+			Protocol:   protocol,
+			SentStr:    formatBytes(bytesSent),
+			RcvdStr:    formatBytes(bytesReceived),
+			SpeedStr:   fmt.Sprintf("%s/s", formatBytes(int64(c.currentSpeedBps))),
+			IP:         ip,
+			FirstConn:  firstConn.Format("15:04:05"),
+			LastActive: time.Unix(atomic.LoadInt64(&c.lastActive), 0).Format("15:04:05"),
+			ConnKey:    connKey,
 		})
 	}
 	sendJSON(w, http.StatusOK, resp)
 }
+
 func (p *Proxy) handleAPIServerStatus(w http.ResponseWriter, r *http.Request) {
-	p.statusMutex.RLock(); defer p.statusMutex.RUnlock(); sendJSON(w, http.StatusOK, p.systemStatus)
+	p.statusMutex.RLock()
+	defer p.statusMutex.RUnlock()
+	sendJSON(w, http.StatusOK, p.systemStatus)
 }
+
 func (p *Proxy) handleAPILogs(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, http.StatusOK, p.logBuffer.GetLogs())
 }
-func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {}
-func (p *Proxy) handleAdminPost(w http.ResponseWriter, r *http.Request) {}
 
-var adminPanelHTML, loginPanelHTML []byte
-var sessions = make(map[string]Session)
-var sessionsLock sync.RWMutex
-type Session struct { Username string; Expiry time.Time }
-const sessionCookieName = "wstunnel_session"
+func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request)       {} // Placeholder
+func (p *Proxy) handleAdminPost(w http.ResponseWriter, r *http.Request) {} // Placeholder
 
 func (p *Proxy) authMiddleware(next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(sessionCookieName)
-		if err != nil { w.Header().Set("Content-Type", "text/html; charset=utf-8"); w.Write(loginPanelHTML); return }
-		sessionsLock.RLock(); session, ok := sessions[cookie.Value]; sessionsLock.RUnlock()
+		if err != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(loginPanelHTML)
+			return
+		}
+		sessionsLock.RLock()
+		session, ok := sessions[cookie.Value]
+		sessionsLock.RUnlock()
+
 		if !ok || time.Now().After(session.Expiry) {
-			if ok { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
-			w.Header().Set("Content-Type", "text/html; charset=utf-8"); w.Write(loginPanelHTML); return
+			if ok {
+				sessionsLock.Lock()
+				delete(sessions, cookie.Value)
+				sessionsLock.Unlock()
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(loginPanelHTML)
+			return
 		}
 		ctx := context.WithValue(r.Context(), "user", session.Username)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }
+
 func (p *Proxy) loginHandler(w http.ResponseWriter, r *http.Request) {
-	var creds struct{ Username string `json:"username"`; Password string `json:"password"`}
-	if json.NewDecoder(r.Body).Decode(&creds) != nil {
-		sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求格式"}); return
+	var creds struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
 	}
-	p.cfg.lock.RLock(); storedPass, ok := p.cfg.Accounts[creds.Username]; p.cfg.lock.RUnlock()
-	if !ok { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }
+	if json.NewDecoder(r.Body).Decode(&creds) != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求格式"})
+		return
+	}
+	p.cfg.lock.RLock()
+	storedPass, ok := p.cfg.Accounts[creds.Username]
+	p.cfg.lock.RUnlock()
+
+	if !ok {
+		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"})
+		return
+	}
 	var valid bool
 	if len(storedPass) >= 60 && strings.HasPrefix(storedPass, "$2a$") {
 		valid = checkPasswordHash(creds.Password, storedPass)
-	} else { valid = (creds.Password == storedPass) }
-	if !valid { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }
-	sessionTokenBytes := make([]byte, 32); rand.Read(sessionTokenBytes)
+	} else {
+		valid = (creds.Password == storedPass)
+	}
+	if !valid {
+		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"})
+		return
+	}
+
+	sessionTokenBytes := make([]byte, 32)
+	rand.Read(sessionTokenBytes)
 	sessionToken := hex.EncodeToString(sessionTokenBytes)
 	expiry := time.Now().Add(12 * time.Hour)
-	sessionsLock.Lock(); sessions[sessionToken] = Session{Username: creds.Username, Expiry: expiry}; sessionsLock.Unlock()
+
+	sessionsLock.Lock()
+	sessions[sessionToken] = Session{Username: creds.Username, Expiry: expiry}
+	sessionsLock.Unlock()
+
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
+
 func (p *Proxy) logoutHandler(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
-		sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock()
+		sessionsLock.Lock()
+		delete(sessions, cookie.Value)
+		sessionsLock.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
 	w.WriteHeader(http.StatusOK)
@@ -774,21 +932,34 @@ func main() {
 
 	var err error
 	adminPanelHTML, err = os.ReadFile("admin.html")
-	if err != nil { log.Printf("[!] admin.html not found, admin panel will be disabled: %v", err) }
+	if err != nil {
+		log.Printf("[!] admin.html not found, admin panel will be disabled: %v", err)
+	}
 	loginPanelHTML, err = os.ReadFile("login.html")
-	if err != nil { log.Printf("[!] login.html not found, admin panel will be disabled: %v", err) }
+	if err != nil {
+		log.Printf("[!] login.html not found, admin panel will be disabled: %v", err)
+	}
 
 	cfg, err := LoadConfig()
-	if err != nil { log.Fatalf("[!] Failed to load config: %v", err) }
+	if err != nil {
+		log.Fatalf("[!] Failed to load config: %v", err)
+	}
 
 	proxy, err := NewProxy(cfg)
-	if err != nil { log.Fatalf("[!] Failed to create proxy: %v", err) }
+	if err != nil {
+		log.Fatalf("[!] Failed to create proxy: %v", err)
+	}
 
-	if err := proxy.Start(); err != nil { log.Fatalf("[!] Failed to start proxy: %v", err) }
+	if err := proxy.Start(); err != nil {
+		log.Fatalf("[!] Failed to start proxy: %v", err)
+	}
 
 	adminMux := http.NewServeMux()
 	if adminPanelHTML != nil && loginPanelHTML != nil {
-		rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "text/html; charset=utf-8"); w.Write(adminPanelHTML) })
+		rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(adminPanelHTML)
+		})
 		adminMux.HandleFunc("/login", proxy.loginHandler)
 		adminMux.HandleFunc("/logout", proxy.logoutHandler)
 		apiHandler := http.HandlerFunc(proxy.handleAPI)
@@ -824,36 +995,57 @@ func main() {
 	proxy.Shutdown()
 }
 
+// --- Utility Functions ---
+
 func sendHTTPErrorAndClose(conn net.Conn, statusCode int, statusText, body string) {
 	response := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", statusCode, statusText, len(body), body)
 	_, _ = conn.Write([]byte(response))
 	conn.Close()
 }
+
 func extractHeaderValue(text, name string) string {
 	re := regexp.MustCompile(fmt.Sprintf(`(?mi)^%s:\s*(.+)$`, regexp.QuoteMeta(name)))
 	m := re.FindStringSubmatch(text)
-	if len(m) > 1 { return strings.TrimSpace(m[1]) }
+	if len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
 	return ""
 }
+
 func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, _ := json.Marshal(payload)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code); _, _ = w.Write(response)
+	w.WriteHeader(code)
+	_, _ = w.Write(response)
 }
+
 func formatBytes(b int64) string {
-	const unit = 1024; if b < unit { return fmt.Sprintf("%d B", b) }
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
 	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit { div *= unit; exp++ }
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
 	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
+
 func isIPInList(ip string, list []string) bool {
-	for _, item := range list { if item == ip { return true } }
+	for _, item := range list {
+		if item == ip {
+			return true
+		}
+	}
 	return false
 }
+
 func hashPassword(password string) (string, error) {
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	return string(bytes), err
 }
+
 func checkPasswordHash(password, hash string) bool {
 	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 	return err == nil
