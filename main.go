@@ -1,4 +1,3 @@
-// ssh_relay_with_http.go
 package main
 
 import (
@@ -93,9 +92,10 @@ func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error
 }
 
 // handleDirectTCPIP 处理 direct-tcpip channel
-func handleDirectTCPIP(ch ssh.Channel, req *ssh.Request, destHost string, destPort uint32) {
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConnCount, 1)
 	defer atomic.AddInt64(&activeConnCount, -1)
+
 	sockConn, err := socks5Connect(*localSocks, destHost, uint16(destPort))
 	if err != nil {
 		log.Printf("socks connect fail: %v", err)
@@ -163,12 +163,12 @@ func handleConnWithHTTPAuth(c net.Conn, config *ssh.ServerConfig) {
 				newChan.Reject(ssh.ConnectionFailed, "bad payload")
 				continue
 			}
-			ch, req, err := newChan.Accept()
+			ch, err := newChan.Accept()
 			if err != nil {
 				log.Println("accept channel err:", err)
 				continue
 			}
-			go handleDirectTCPIP(ch, req, payload.Host, payload.Port)
+			go handleDirectTCPIP(ch, payload.Host, payload.Port)
 		} else {
 			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
 		}
@@ -186,7 +186,7 @@ func main() {
 	config := &ssh.ServerConfig{
 		NoClientAuth: false,
 		PasswordCallback: func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			// 自定义账号密码
+			// 自定义账号密码 a555:a444
 			if conn.User() == "a555" && string(pass) == "a444" {
 				return nil, nil
 			}
