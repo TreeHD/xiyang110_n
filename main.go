@@ -1,4 +1,4 @@
-// wstunnel_multi.go完整版
+// wstunnel_full_reuse_socks.go
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
@@ -23,36 +24,34 @@ var (
 	pass       = flag.String("pass", "a444", "SSH password")
 )
 
-var activeConn int64
+var (
+	activeConn int64
+	socksConn  net.Conn
+	socksLock  = &sync.Mutex{}
+)
 
 func handleDirectTCPIP(ch ssh.Channel) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	// TCP 透传到 SOCKS5
-	socksConn, err := net.Dial("tcp", *socksAddr)
-	if err != nil {
-		log.Printf("connect to SOCKS5 fail: %v", err)
-		ch.Close()
-		return
-	}
-	defer socksConn.Close()
-
 	done := make(chan struct{}, 2)
 	go func() {
+		socksLock.Lock()
 		io.Copy(socksConn, ch)
-		socksConn.Close()
+		socksLock.Unlock()
 		done <- struct{}{}
 	}()
 	go func() {
+		socksLock.Lock()
 		io.Copy(ch, socksConn)
-		ch.Close()
+		socksLock.Unlock()
 		done <- struct{}{}
 	}()
 	<-done
+	ch.Close()
 }
 
-// 检查 HTTP 请求头 User-Agent
+// HTTP 阶段 User-Agent 验证
 func httpHandshake(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
 	for {
@@ -66,56 +65,16 @@ func httpHandshake(conn net.Conn) error {
 		}
 		if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
 			if strings.Contains(line, "26.4.0") {
-				// 返回 200 OK
 				_, err := conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 				if err != nil {
 					return fmt.Errorf("write http response fail: %v", err)
 				}
 				return nil
-			} else {
-				return fmt.Errorf("invalid user-agent")
 			}
+			return fmt.Errorf("invalid user-agent")
 		}
 	}
 	return fmt.Errorf("user-agent not found")
-}
-
-func handleSSHConnection(c net.Conn, config *ssh.ServerConfig) {
-	defer c.Close()
-	atomic.AddInt64(&activeConn, 1)
-	defer atomic.AddInt64(&activeConn, -1)
-
-	// HTTP 阶段握手
-	if err := httpHandshake(c); err != nil {
-		log.Printf("http handshake failed: %v", err)
-		return
-	}
-	log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
-
-	// SSH 握手
-	sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
-	if err != nil {
-		log.Printf("ssh handshake failed: %v", err)
-		return
-	}
-	defer sshConn.Close()
-	log.Printf("Phase 2: SSH handshake success from %s", sshConn.RemoteAddr())
-	go ssh.DiscardRequests(reqs)
-
-	// 多 channel 循环
-	for newChan := range chans {
-		if newChan.ChannelType() != "direct-tcpip" {
-			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
-			continue
-		}
-		ch, _, err := newChan.Accept()
-		if err != nil {
-			log.Printf("accept channel fail: %v", err)
-			continue
-		}
-
-		go handleDirectTCPIP(ch)
-	}
 }
 
 func main() {
@@ -142,6 +101,14 @@ func main() {
 	}
 	config.AddHostKey(privateKey)
 
+	// 建立持久 SOCKS5 连接
+	socksConn, err = net.Dial("tcp", *socksAddr)
+	if err != nil {
+		log.Fatalf("connect to SOCKS5 fail: %v", err)
+	}
+	defer socksConn.Close()
+	log.Printf("Using persistent SOCKS5 connection to %s", *socksAddr)
+
 	// 监听端口
 	l, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -156,6 +123,44 @@ func main() {
 			continue
 		}
 
-		go handleSSHConnection(conn, config)
+		go func(c net.Conn) {
+			atomic.AddInt64(&activeConn, 1)
+			defer atomic.AddInt64(&activeConn, -1)
+
+			// HTTP 阶段握手
+			if err := httpHandshake(c); err != nil {
+				log.Printf("http handshake failed: %v", err)
+				c.Close()
+				return
+			}
+			log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
+
+			// SSH 握手
+			sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
+			if err != nil {
+				log.Printf("ssh handshake failed: %v", err)
+				c.Close()
+				return
+			}
+			defer sshConn.Close()
+			log.Printf("Phase 2: SSH handshake success from %s", sshConn.RemoteAddr())
+			go ssh.DiscardRequests(reqs)
+
+			for newChan := range chans {
+				if newChan.ChannelType() != "direct-tcpip" {
+					newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
+					continue
+				}
+				ch, _, err := newChan.Accept()
+				if err != nil {
+					log.Printf("accept channel fail: %v", err)
+					continue
+				}
+
+				// 直接透传，不解析 ExtraData
+				go handleDirectTCPIP(ch)
+			}
+
+		}(conn)
 	}
 }
