@@ -1,4 +1,4 @@
-// wstunnel_full.go1
+// wstunnel_multi.go完整版
 package main
 
 import (
@@ -25,72 +25,12 @@ var (
 
 var activeConn int64
 
-// SOCKS5 connect
-func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) {
-	c, err := net.Dial("tcp", socksAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	// NO AUTH
-	_, err = c.Write([]byte{0x05, 0x01, 0x00})
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(c, buf); err != nil {
-		c.Close()
-		return nil, err
-	}
-	if buf[1] != 0x00 {
-		c.Close()
-		return nil, fmt.Errorf("socks5 auth failed")
-	}
-
-	// CONNECT request
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}
-	req = append(req, []byte(destHost)...)
-	req = append(req, byte(destPort>>8), byte(destPort&0xff))
-	_, err = c.Write(req)
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-
-	// reply
-	rep := make([]byte, 4)
-	if _, err := io.ReadFull(c, rep); err != nil {
-		c.Close()
-		return nil, err
-	}
-	if rep[1] != 0x00 {
-		c.Close()
-		return nil, fmt.Errorf("socks5 connect failed")
-	}
-
-	// read remaining address info
-	switch rep[3] {
-	case 0x01:
-		io.CopyN(io.Discard, c, 4+2)
-	case 0x03:
-		alen := make([]byte, 1)
-		io.ReadFull(c, alen)
-		io.CopyN(io.Discard, c, int64(alen[0])+2)
-	case 0x04:
-		io.CopyN(io.Discard, c, 16+2)
-	}
-
-	return c, nil
-}
-
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
+func handleDirectTCPIP(ch ssh.Channel) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
 	// TCP 透传到 SOCKS5
-	socksConn, err := socks5Connect(*socksAddr, destHost, uint16(destPort))
+	socksConn, err := net.Dial("tcp", *socksAddr)
 	if err != nil {
 		log.Printf("connect to SOCKS5 fail: %v", err)
 		ch.Close()
@@ -140,9 +80,48 @@ func httpHandshake(conn net.Conn) error {
 	return fmt.Errorf("user-agent not found")
 }
 
+func handleSSHConnection(c net.Conn, config *ssh.ServerConfig) {
+	defer c.Close()
+	atomic.AddInt64(&activeConn, 1)
+	defer atomic.AddInt64(&activeConn, -1)
+
+	// HTTP 阶段握手
+	if err := httpHandshake(c); err != nil {
+		log.Printf("http handshake failed: %v", err)
+		return
+	}
+	log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
+
+	// SSH 握手
+	sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
+	if err != nil {
+		log.Printf("ssh handshake failed: %v", err)
+		return
+	}
+	defer sshConn.Close()
+	log.Printf("Phase 2: SSH handshake success from %s", sshConn.RemoteAddr())
+	go ssh.DiscardRequests(reqs)
+
+	// 多 channel 循环
+	for newChan := range chans {
+		if newChan.ChannelType() != "direct-tcpip" {
+			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
+			continue
+		}
+		ch, _, err := newChan.Accept()
+		if err != nil {
+			log.Printf("accept channel fail: %v", err)
+			continue
+		}
+
+		go handleDirectTCPIP(ch)
+	}
+}
+
 func main() {
 	flag.Parse()
 
+	// SSH Server 配置
 	config := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 			if c.User() == *user && string(p) == *pass {
@@ -163,6 +142,7 @@ func main() {
 	}
 	config.AddHostKey(privateKey)
 
+	// 监听端口
 	l, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen fail: %v", err)
@@ -176,53 +156,6 @@ func main() {
 			continue
 		}
 
-		go func(c net.Conn) {
-			atomic.AddInt64(&activeConn, 1)
-			defer atomic.AddInt64(&activeConn, -1)
-
-			if err := httpHandshake(c); err != nil {
-				log.Printf("http handshake failed: %v", err)
-				c.Close()
-				return
-			}
-			log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
-
-			sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
-			if err != nil {
-				log.Printf("ssh handshake failed: %v", err)
-				c.Close()
-				return
-			}
-			defer sshConn.Close()
-			log.Printf("Phase 2: SSH handshake success from %s", sshConn.RemoteAddr())
-			go ssh.DiscardRequests(reqs)
-
-			for newChan := range chans {
-				if newChan.ChannelType() != "direct-tcpip" {
-					newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
-					continue
-				}
-				ch, _, err := newChan.Accept()
-				if err != nil {
-					log.Printf("accept channel fail: %v", err)
-					continue
-				}
-
-				var payload struct {
-					Host       string
-					Port       uint32
-					OriginAddr string
-					OriginPort uint32
-				}
-				if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil {
-					log.Printf("bad payload: %v", err)
-					ch.Close()
-					continue
-				}
-
-				go handleDirectTCPIP(ch, payload.Host, payload.Port)
-			}
-
-		}(conn)
+		go handleSSHConnection(conn, config)
 	}
 }
