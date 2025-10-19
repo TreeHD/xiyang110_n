@@ -1,4 +1,4 @@
-// ssh_http_relay.go
+// wstunnel-http-ssh.go
 package main
 
 import (
@@ -9,42 +9,35 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
 var (
-	addr      = flag.String("addr", ":2222", "listen address")
-	hostKey   = flag.String("hostkey", "/etc/ssh_relay/host_ed25519", "SSH host key path")
-	socksAddr = flag.String("socks", "127.0.0.1:1080", "local SOCKS5 address")
+	addr        = flag.String("addr", ":2222", "listen address")
+	hostKeyPath = flag.String("hostkey", "/etc/ssh_relay/host_ed25519", "host key file (PEM/openssh)")
+	socksAddr   = flag.String("socks", "127.0.0.1:1080", "local SOCKS5 address")
 )
 
-// loadHostKey 加载 SSH host key
+var activeConnCount int64
+
 func loadHostKey(path string) (ssh.Signer, error) {
-	b, err := os.ReadFile(path)
+	keyData, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return ssh.ParsePrivateKey(b)
+	return ssh.ParsePrivateKey(keyData)
 }
 
-// connWithReader 包装 net.Conn 并使用自定义 Reader
-type connWithReader struct {
-	net.Conn
-	r io.Reader
-}
-
-func (c *connWithReader) Read(p []byte) (int, error) {
-	return c.r.Read(p)
-}
-
-// socks5Connect 简单直连到 SOCKS5
+// minimal SOCKS5 connect
 func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) {
-	c, err := net.Dial("tcp", socksAddr)
+	c, err := net.DialTimeout("tcp", socksAddr, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	// minimal SOCKS5 handshake: no auth
+	// no-auth handshake
 	_, err = c.Write([]byte{0x05, 0x01, 0x00})
 	if err != nil {
 		c.Close()
@@ -59,10 +52,8 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 		c.Close()
 		return nil, fmt.Errorf("socks5 auth failed")
 	}
-	// build CONNECT request
-	req := []byte{0x05, 0x01, 0x00}
-	req = append(req, 0x03)                 // domain
-	req = append(req, byte(len(destHost)))  // host len
+	// CONNECT request
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}
 	req = append(req, []byte(destHost)...)
 	req = append(req, byte(destPort>>8), byte(destPort&0xff))
 	if _, err := c.Write(req); err != nil {
@@ -70,17 +61,17 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 		return nil, err
 	}
 	// read reply
-	h := make([]byte, 4)
-	if _, err := io.ReadFull(c, h); err != nil {
+	rep := make([]byte, 4)
+	if _, err := io.ReadFull(c, rep); err != nil {
 		c.Close()
 		return nil, err
 	}
-	if h[1] != 0x00 {
+	if rep[1] != 0x00 {
 		c.Close()
-		return nil, fmt.Errorf("socks5 connect failed, rep=%d", h[1])
+		return nil, fmt.Errorf("socks5 connect failed, rep=%d", rep[1])
 	}
-	// read addr/port
-	switch h[3] {
+	// discard remaining addr/port
+	switch rep[3] {
 	case 0x01:
 		_, _ = io.CopyN(io.Discard, c, 4+2)
 	case 0x03:
@@ -96,12 +87,13 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 	return c, nil
 }
 
-// handleDirectTCPIP 转发 direct-tcpip channel 到 SOCKS5
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
-	defer ch.Close()
+	atomic.AddInt64(&activeConnCount, 1)
+	defer atomic.AddInt64(&activeConnCount, -1)
 	sockConn, err := socks5Connect(*socksAddr, destHost, uint16(destPort))
 	if err != nil {
 		log.Printf("socks connect failed: %v", err)
+		ch.Close()
 		return
 	}
 	defer sockConn.Close()
@@ -120,66 +112,56 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	<-done
 }
 
-// handleConnection 处理每个客户端连接
-func handleConnection(conn net.Conn, config *ssh.ServerConfig) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
+func handleConn(c net.Conn, config *ssh.ServerConfig) {
+	defer c.Close()
 
-	// ===== HTTP 阶段认证 =====
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("read http header failed: %v", err)
-			return
+	reader := bufio.NewReader(c)
+
+	// HTTP 阶段（可选认证）
+	c.SetReadDeadline(time.Now().Add(3 * time.Second)) // 超时防止客户端不发数据阻塞
+	peek, err := reader.Peek(4)
+	c.SetReadDeadline(time.Time{}) // 取消超时
+	if err == nil && (string(peek) == "GET " || string(peek) == "POST") {
+		// 简单读取 HTTP 请求行和 User-Agent
+		reqLine, _ := reader.ReadString('\n')
+		for {
+			line, _ := reader.ReadString('\n')
+			if line == "\r\n" || line == "\n" {
+				break
+			}
 		}
-		line = line[:len(line)-1] // 去掉 \n
-		if line == "" {           // HTTP header 结束
-			break
-		}
-		if line == "User-Agent: 1.0" {
-			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-		}
+		// 返回 200 OK
+		c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	}
 
-	// ===== 等待 SSH payload =====
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("read http phase2 failed: %v", err)
-			return
-		}
-		if line == "User-Agent: 26.4.0\n" {
-			log.Printf("Phase2: HTTP auth done, start SSH handshake")
-			break
-		}
-	}
-
-	// ===== SSH handshake =====
-	cwrap := &connWithReader{
-		Conn: conn,
-		r:    reader,
-	}
-	sshConn, chans, reqs, err := ssh.NewServerConn(cwrap, config)
+	// 进入 SSH handshake
+	sshConn, chans, reqs, err := ssh.NewServerConn(reader, config)
 	if err != nil {
 		log.Printf("ssh handshake failed: %v", err)
 		return
 	}
 	defer sshConn.Close()
-	log.Printf("New SSH connection from %s", sshConn.RemoteAddr())
+	log.Printf("new ssh conn from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 
-	// 丢弃全局请求
+	// discard global requests
 	go ssh.DiscardRequests(reqs)
 
-	// 只处理 direct-tcpip channel
+	// handle channels
 	for newChan := range chans {
 		if newChan.ChannelType() == "direct-tcpip" {
-			ch, req, err := newChan.Accept()
-			if err != nil {
-				log.Printf("accept channel failed: %v", err)
+			var payload struct {
+				Host string
+				Port uint32
+			}
+			if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil {
+				newChan.Reject(ssh.ConnectionFailed, "bad payload")
 				continue
 			}
-			go handleDirectTCPIP(ch, string(newChan.ExtraData()), 0)
-			_ = req
+			ch, _, err := newChan.Accept()
+			if err != nil {
+				continue
+			}
+			go handleDirectTCPIP(ch, payload.Host, payload.Port)
 		} else {
 			newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
 		}
@@ -188,16 +170,14 @@ func handleConnection(conn net.Conn, config *ssh.ServerConfig) {
 
 func main() {
 	flag.Parse()
-	hostSigner, err := loadHostKey(*hostKey)
+
+	hostSigner, err := loadHostKey(*hostKeyPath)
 	if err != nil {
-		log.Fatalf("load host key failed: %v", err)
+		log.Fatalf("load host key error: %v", err)
 	}
 
 	config := &ssh.ServerConfig{
-		NoClientAuth: false,
-		PasswordCallback: func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			return nil, fmt.Errorf("password auth disabled")
-		},
+		NoClientAuth: true,
 	}
 	config.AddHostKey(hostSigner)
 
@@ -208,11 +188,11 @@ func main() {
 	log.Printf("Listening on %s, using SOCKS5 %s", *addr, *socksAddr)
 
 	for {
-		c, err := l.Accept()
+		conn, err := l.Accept()
 		if err != nil {
-			log.Printf("accept failed: %v", err)
+			log.Printf("accept error: %v", err)
 			continue
 		}
-		go handleConnection(c, config)
+		go handleConn(conn, config)
 	}
 }
