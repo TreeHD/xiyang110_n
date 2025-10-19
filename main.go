@@ -1,4 +1,4 @@
-// wstunnel_full_reuse_socks.go
+// wstunnel_reuse.go
 package main
 
 import (
@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
@@ -24,34 +23,96 @@ var (
 	pass       = flag.String("pass", "a444", "SSH password")
 )
 
-var (
-	activeConn int64
-	socksConn  net.Conn
-	socksLock  = &sync.Mutex{}
-)
+var activeConn int64
 
-func handleDirectTCPIP(ch ssh.Channel) {
+// SOCKS5 connect
+func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) {
+	c, err := net.Dial("tcp", socksAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	// NO AUTH
+	_, err = c.Write([]byte{0x05, 0x01, 0x00})
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if buf[1] != 0x00 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 auth failed")
+	}
+
+	// CONNECT request
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}
+	req = append(req, []byte(destHost)...)
+	req = append(req, byte(destPort>>8), byte(destPort&0xff))
+	_, err = c.Write(req)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	// reply
+	rep := make([]byte, 4)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if rep[1] != 0x00 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 connect failed")
+	}
+
+	// read remaining address info
+	switch rep[3] {
+	case 0x01:
+		io.CopyN(io.Discard, c, 4+2)
+	case 0x03:
+		alen := make([]byte, 1)
+		io.ReadFull(c, alen)
+		io.CopyN(io.Discard, c, int64(alen[0])+2)
+	case 0x04:
+		io.CopyN(io.Discard, c, 16+2)
+	}
+
+	return c, nil
+}
+
+// 转发 channel 到 SOCKS5
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
+	socksConn, err := socks5Connect(*socksAddr, destHost, uint16(destPort))
+	if err != nil {
+		log.Printf("connect to SOCKS5 fail: %v", err)
+		ch.Close()
+		return
+	}
+	defer socksConn.Close()
+
 	done := make(chan struct{}, 2)
 	go func() {
-		socksLock.Lock()
 		io.Copy(socksConn, ch)
-		socksLock.Unlock()
+		socksConn.Close()
 		done <- struct{}{}
 	}()
 	go func() {
-		socksLock.Lock()
 		io.Copy(ch, socksConn)
-		socksLock.Unlock()
+		ch.Close()
 		done <- struct{}{}
 	}()
 	<-done
-	ch.Close()
 }
 
-// HTTP 阶段 User-Agent 验证
+// HTTP 阶段握手
 func httpHandshake(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
 	for {
@@ -60,7 +121,7 @@ func httpHandshake(conn net.Conn) error {
 			return fmt.Errorf("read http header fail: %v", err)
 		}
 		line = strings.TrimSpace(line)
-		if line == "" { // headers end
+		if line == "" {
 			break
 		}
 		if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
@@ -70,8 +131,9 @@ func httpHandshake(conn net.Conn) error {
 					return fmt.Errorf("write http response fail: %v", err)
 				}
 				return nil
+			} else {
+				return fmt.Errorf("invalid user-agent")
 			}
-			return fmt.Errorf("invalid user-agent")
 		}
 	}
 	return fmt.Errorf("user-agent not found")
@@ -80,7 +142,6 @@ func httpHandshake(conn net.Conn) error {
 func main() {
 	flag.Parse()
 
-	// SSH Server 配置
 	config := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 			if c.User() == *user && string(p) == *pass {
@@ -90,7 +151,7 @@ func main() {
 		},
 	}
 
-	// 生成 Ed25519 host key
+	// Ed25519 host key
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatalf("generate host key fail: %v", err)
@@ -101,15 +162,6 @@ func main() {
 	}
 	config.AddHostKey(privateKey)
 
-	// 建立持久 SOCKS5 连接
-	socksConn, err = net.Dial("tcp", *socksAddr)
-	if err != nil {
-		log.Fatalf("connect to SOCKS5 fail: %v", err)
-	}
-	defer socksConn.Close()
-	log.Printf("Using persistent SOCKS5 connection to %s", *socksAddr)
-
-	// 监听端口
 	l, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen fail: %v", err)
@@ -127,7 +179,6 @@ func main() {
 			atomic.AddInt64(&activeConn, 1)
 			defer atomic.AddInt64(&activeConn, -1)
 
-			// HTTP 阶段握手
 			if err := httpHandshake(c); err != nil {
 				log.Printf("http handshake failed: %v", err)
 				c.Close()
@@ -135,30 +186,30 @@ func main() {
 			}
 			log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
 
-			// SSH 握手
 			sshConn, chans, reqs, err := ssh.NewServerConn(c, config)
 			if err != nil {
 				log.Printf("ssh handshake failed: %v", err)
 				c.Close()
 				return
 			}
-			defer sshConn.Close()
 			log.Printf("Phase 2: SSH handshake success from %s", sshConn.RemoteAddr())
 			go ssh.DiscardRequests(reqs)
 
+			// 多 channel 循环处理，保持同一条 TCP 隧道复用
 			for newChan := range chans {
 				if newChan.ChannelType() != "direct-tcpip" {
 					newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
 					continue
 				}
+
 				ch, _, err := newChan.Accept()
 				if err != nil {
 					log.Printf("accept channel fail: %v", err)
 					continue
 				}
 
-				// 直接透传，不解析 ExtraData
-				go handleDirectTCPIP(ch)
+				// ExtraData 不再解析，直接透传 TCP
+				go handleDirectTCPIP(ch, "", 0)
 			}
 
 		}(conn)
