@@ -1,4 +1,4 @@
-// wstunnel_reuse.go333
+// wstunnel_full.go
 package main
 
 import (
@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
@@ -26,77 +25,94 @@ var (
 
 var activeConn int64
 
-type ReuseSOCKS struct {
-	mu   sync.Mutex
-	conn net.Conn
-}
-
-func (r *ReuseSOCKS) getConn() (net.Conn, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.conn != nil {
-		return r.conn, nil
-	}
-	c, err := net.Dial("tcp", *socksAddr)
+// SOCKS5 connect
+func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) {
+	c, err := net.Dial("tcp", socksAddr)
 	if err != nil {
 		return nil, err
 	}
-	r.conn = c
+
+	// NO AUTH
+	_, err = c.Write([]byte{0x05, 0x01, 0x00})
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if buf[1] != 0x00 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 auth failed")
+	}
+
+	// CONNECT request
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}
+	req = append(req, []byte(destHost)...)
+	req = append(req, byte(destPort>>8), byte(destPort&0xff))
+	_, err = c.Write(req)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	// reply
+	rep := make([]byte, 4)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if rep[1] != 0x00 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 connect failed")
+	}
+
+	// read remaining address info
+	switch rep[3] {
+	case 0x01:
+		io.CopyN(io.Discard, c, 4+2)
+	case 0x03:
+		alen := make([]byte, 1)
+		io.ReadFull(c, alen)
+		io.CopyN(io.Discard, c, int64(alen[0])+2)
+	case 0x04:
+		io.CopyN(io.Discard, c, 16+2)
+	}
+
 	return c, nil
 }
-
-var socksReuse ReuseSOCKS
 
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
-	// 获取 SOCKS5 连接（复用）
-	socksConn, err := socksReuse.getConn()
+	// TCP 透传到 SOCKS5
+	socksConn, err := socks5Connect(*socksAddr, destHost, uint16(destPort))
 	if err != nil {
 		log.Printf("connect to SOCKS5 fail: %v", err)
 		ch.Close()
 		return
 	}
-
-	// 构建 SOCKS5 CONNECT 请求（每个 channel 独立发送）
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}
-	req = append(req, []byte(destHost)...)
-	req = append(req, byte(destPort>>8), byte(destPort&0xff))
-	socksConn.Write(req)
-
-	// 读取 SOCKS5 响应
-	rep := make([]byte, 4)
-	if _, err := io.ReadFull(socksConn, rep); err != nil {
-		log.Printf("read socks5 reply fail: %v", err)
-		ch.Close()
-		return
-	}
-	switch rep[3] {
-	case 0x01:
-		io.CopyN(io.Discard, socksConn, 4+2)
-	case 0x03:
-		alen := make([]byte, 1)
-		io.ReadFull(socksConn, alen)
-		io.CopyN(io.Discard, socksConn, int64(alen[0])+2)
-	case 0x04:
-		io.CopyN(io.Discard, socksConn, 16+2)
-	}
+	defer socksConn.Close()
 
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(socksConn, ch)
+		socksConn.Close()
 		done <- struct{}{}
 	}()
 	go func() {
 		io.Copy(ch, socksConn)
+		ch.Close()
 		done <- struct{}{}
 	}()
 	<-done
-	ch.Close()
 }
 
-// HTTP 阶段握手
+// 检查 HTTP 请求头 User-Agent
 func httpHandshake(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
 	for {
@@ -105,18 +121,20 @@ func httpHandshake(conn net.Conn) error {
 			return fmt.Errorf("read http header fail: %v", err)
 		}
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" { // headers end
 			break
 		}
 		if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
 			if strings.Contains(line, "26.4.0") {
+				// 返回 200 OK
 				_, err := conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 				if err != nil {
 					return fmt.Errorf("write http response fail: %v", err)
 				}
 				return nil
+			} else {
+				return fmt.Errorf("invalid user-agent")
 			}
-			return fmt.Errorf("invalid user-agent")
 		}
 	}
 	return fmt.Errorf("user-agent not found")
@@ -134,7 +152,7 @@ func main() {
 		},
 	}
 
-	// Ed25519 host key
+	// 生成 Ed25519 host key
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatalf("generate host key fail: %v", err)
