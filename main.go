@@ -1,4 +1,4 @@
-// wstunnel-go.go
+// wstunnel-go-auth-pass.go
 package main
 
 import (
@@ -37,6 +37,7 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 	if err != nil {
 		return nil, err
 	}
+	// no-auth negotiation
 	_, err = c.Write([]byte{0x05, 0x01, 0x00})
 	if err != nil {
 		c.Close()
@@ -52,6 +53,7 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 		return nil, fmt.Errorf("socks5 auth failed")
 	}
 
+	// CONNECT request (domain)
 	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}
 	req = append(req, []byte(destHost)...)
 	req = append(req, byte(destPort>>8), byte(destPort&0xff))
@@ -60,6 +62,7 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 		return nil, err
 	}
 
+	// read reply
 	rep := make([]byte, 4)
 	if _, err := io.ReadFull(c, rep); err != nil {
 		c.Close()
@@ -69,7 +72,6 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 		c.Close()
 		return nil, fmt.Errorf("socks5 connect failed, rep=%d", rep[1])
 	}
-
 	switch rep[3] {
 	case 0x01:
 		_, _ = io.CopyN(io.Discard, c, 4+2)
@@ -83,7 +85,6 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 	case 0x04:
 		_, _ = io.CopyN(io.Discard, c, 16+2)
 	}
-
 	return c, nil
 }
 
@@ -128,31 +129,28 @@ func handleConn(c net.Conn, config *ssh.ServerConfig) {
 
 	reader := bufio.NewReader(c)
 
-	// HTTP 阶段（可选认证）
+	// Optional HTTP phase detection: peek first bytes with a short timeout
 	c.SetReadDeadline(time.Now().Add(3 * time.Second))
 	peek, err := reader.Peek(4)
-	c.SetReadDeadline(time.Time{}) // cancel deadline
+	c.SetReadDeadline(time.Time{})
 
-	var preReadBuffer io.Reader
+	var preReader io.Reader = reader
 	if err == nil && (string(peek) == "GET " || string(peek) == "POST") {
-		// 读取 HTTP 请求行和 header
-		_, _ = reader.ReadString('\n') // 忽略请求行
+		// simple consume headers until blank line
+		_, _ = reader.ReadString('\n') // ignore request line
 		for {
 			line, _ := reader.ReadString('\n')
 			if line == "\r\n" || line == "\n" {
 				break
 			}
 		}
+		// reply OK and continue waiting for SSH
 		c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-
-		// 把已经读取的缓冲返回给 SSH handshake
-		preReadBuffer = reader
-	} else {
-		preReadBuffer = reader
+		// preReader already set to reader so remaining bytes are preserved
 	}
 
-	// SSH handshake
-	sshConn, chans, reqs, err := ssh.NewServerConn(&connWithReader{Conn: c, Reader: preReadBuffer}, config)
+	// SSH handshake: wrap conn so Read uses buffered reader (preserves already-read bytes)
+	sshConn, chans, reqs, err := ssh.NewServerConn(&connWithReader{Conn: c, Reader: preReader}, config)
 	if err != nil {
 		log.Printf("ssh handshake failed: %v", err)
 		return
@@ -160,6 +158,7 @@ func handleConn(c net.Conn, config *ssh.ServerConfig) {
 	defer sshConn.Close()
 	log.Printf("new ssh conn from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 
+	// discard global requests
 	go ssh.DiscardRequests(reqs)
 
 	for newChan := range chans {
@@ -191,8 +190,17 @@ func main() {
 		log.Fatalf("load host key error: %v", err)
 	}
 
+	// ---- 修改处：使用密码认证 ----
 	config := &ssh.ServerConfig{
-		NoClientAuth: true,
+		NoClientAuth: false, // 允许认证
+		PasswordCallback: func(connMetadata ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			// 这里使用你指定的账号密码 a555 / a444
+			if connMetadata.User() == "a555" && string(password) == "a444" {
+				return nil, nil
+			}
+			// 如果需要限制来源 IP / 做日志，可以在此添加
+			return nil, fmt.Errorf("password rejected for %s", connMetadata.User())
+		},
 	}
 	config.AddHostKey(hostSigner)
 
