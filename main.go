@@ -63,7 +63,7 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
 // ==============================================================================
-// === 优化点 1 & 2: 带健康检查和连接池的代理管理 ===
+// === 带健康检查和连接池的代理管理 ===
 // ==============================================================================
 const (
 	StatusUp int32 = iota
@@ -88,6 +88,9 @@ func NewPooledProxy(addr string, poolSize int) *pooledProxy {
 func (p *pooledProxy) getConn() (net.Conn, error) {
 	select {
 	case conn := <-p.pool:
+		if conn == nil { // 池中可能存有 nil
+			return socks5Connect(p.addr, "", 0, true)
+		}
 		return conn, nil
 	default: // 池为空，创建新连接
 		return socks5Connect(p.addr, "", 0, true) // dialOnly=true, 只建连不做SOCKS5请求
@@ -95,13 +98,9 @@ func (p *pooledProxy) getConn() (net.Conn, error) {
 }
 func (p *pooledProxy) putConn(conn net.Conn) {
 	if conn == nil { return }
-	// 检查连接是否仍然有效（可选，但推荐）
-	// 此处简化，直接入池。真实场景可能需要检查 conn.Err()
 	select {
 	case p.pool <- conn:
-		// 连接成功放回池中
 	default:
-		// 池已满，关闭此连接
 		conn.Close()
 	}
 }
@@ -132,6 +131,7 @@ func startHealthChecks(interval time.Duration) {
 	go func() {
 		for range ticker.C {
 			poolLock.RLock()
+			// 立即执行一次检查
 			for _, p := range proxyPool {
 				go p.checkHealth()
 			}
@@ -141,7 +141,7 @@ func startHealthChecks(interval time.Duration) {
 }
 
 
-// --- 辅助函数 (无大变化) ---
+// --- 辅助函数 ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 func createSession(username string) *http.Cookie {
@@ -162,11 +162,11 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, _ := json.Marshal(payload); w.Header().Set("Content-Type", "application/json"); w.WriteHeader(code); w.Write(response)
 }
 
-// --- socks5Connect (微调以支持仅连接) ---
+// --- socks5Connect ---
 func socks5Connect(socksAddr, destHost string, destPort uint16, dialOnly bool) (net.Conn, error) {
 	c, err := net.Dial("tcp", socksAddr); if err != nil { return nil, err }
 	if tcpConn, ok := c.(*net.TCPConn); ok { tcpConn.SetNoDelay(true) }
-	if dialOnly { return c, nil } // 如果只是为了连接池或健康检查，到此为止
+	if dialOnly { return c, nil }
 	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
 	buf := make([]byte, 2); if _, err := io.ReadFull(c, buf); err != nil { c.Close(); return nil, err }
 	if buf[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 auth failed") }
@@ -181,8 +181,13 @@ func socks5Connect(socksAddr, destHost string, destPort uint16, dialOnly bool) (
 }
 
 // ==============================================================================
-// === 优化点 3: 为I/O操作设置超时 ===
+// === 为I/O操作设置超时 (已修正) ===
 // ==============================================================================
+var bufferPool = sync.Pool{New: func() interface{} {
+	b := make([]byte, 64*1024) // 默认64KB
+	return &b
+}}
+
 func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int64, err error) {
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
@@ -193,10 +198,10 @@ func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int
 		}
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			if conn, ok := dst.(net.Writer); ok {
-				if nconn, ok := conn.(net.Conn); ok {
-					nconn.SetWriteDeadline(time.Now().Add(timeout))
-				}
+			// *** BUG FIX HERE ***
+			// 修正: 直接断言 dst 是否为 net.Conn
+			if nconn, ok := dst.(net.Conn); ok {
+				nconn.SetWriteDeadline(time.Now().Add(timeout))
 			}
 			nw, ew := dst.Write(buf[0:nr])
 			if nw < 0 || nr < nw { nw = 0; if ew == nil { ew = io.ErrShortWrite } }
@@ -211,16 +216,10 @@ func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int
 	return written, err
 }
 
-var bufferPool = sync.Pool{New: func() interface{} {
-	b := make([]byte, 64*1024) // 默认64KB
-	return &b
-}}
-
-// --- handleDirectTCPIP (核心逻辑重构) ---
+// --- handleDirectTCPIP ---
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
 	
-	// --- 负载均衡: 选择一个健康的、连接最少的代理 ---
 	var bestProxy *pooledProxy; minConns := int64(math.MaxInt64)
 	poolLock.RLock()
 	healthyProxies := []*pooledProxy{}
@@ -233,20 +232,12 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	
 	bestProxy.incrConnections(); defer bestProxy.decrConnections()
 	
-	// --- 从连接池获取连接或新建连接 ---
-	socksConn, err := socks5Connect(bestProxy.addr, destHost, uint16(destPort), false) // dialOnly=false, 执行完整SOCKS5流程
+	socksConn, err := socks5Connect(bestProxy.addr, destHost, uint16(destPort), false)
 	if err != nil { log.Printf("connect to SOCKS5 proxy %s fail: %v", bestProxy.addr, err); ch.Close(); return }
 	defer socksConn.Close()
 	
 	done := make(chan struct{})
 	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
-
-	// 说明: 零拷贝 (Zero-Copy) 优化
-	// 在Linux下，可以使用 splice(2) 系统调用实现数据在两个文件描述符间的零拷贝转发，
-	// 避免了数据在内核和用户空间之间的拷贝，能极大降低高流量下的CPU开销。
-	// Go标准库的 io.Copy 在特定条件下(e.g., *net.TCPConn -> *os.File)会尝试使用它。
-	// 但在两个网络连接间(ssh.Channel <-> net.Conn)直接使用较为复杂且牺牲了跨平台性。
-	// 当前的带超时的`timedCopy`实现是一种在可移植性和性能之间更均衡的选择。
 
 	go func() {
 		defer func() { if tcpConn, ok := socksConn.(*net.TCPConn); ok { tcpConn.CloseWrite() }; close(done) }()
@@ -354,13 +345,12 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- main (启动逻辑调整) ---
+// --- main ---
 func main() {
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 失败: %v", err) }
 	if globalConfig.ListenAddr == "" || len(globalConfig.SocksAddrs) == 0 || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少 listen_addr, socks_addrs 或 admin_accounts") }
 	
-	// --- 设置默认值 ---
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 3 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
@@ -370,7 +360,6 @@ func main() {
 	if globalConfig.ConnectionPoolSize <= 0 { globalConfig.ConnectionPoolSize = 10 }
 	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
 	
-	// --- 初始化代理池并启动健康检查 ---
 	poolLock.Lock()
 	for _, addr := range globalConfig.SocksAddrs { proxyPool = append(proxyPool, NewPooledProxy(addr, globalConfig.ConnectionPoolSize)) }
 	poolLock.Unlock()
