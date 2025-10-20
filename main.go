@@ -34,10 +34,10 @@ type Config struct {
 	AdminAddr        string                 `json:"admin_addr"`
 	AdminAccounts    map[string]string      `json:"admin_accounts"`
 	Accounts         map[string]AccountInfo `json:"accounts"`
-	// 新增字段: 握手超时时间（单位：秒）
 	HandshakeTimeout int                    `json:"handshake_timeout,omitempty"`
-	// 新增字段: 用于连接验证的 User-Agent
 	ConnectUA        string                 `json:"connect_ua,omitempty"`
+	// 新增字段: 数据转发缓冲区大小 (单位: KB)
+	BufferSizeKB     int                    `json:"buffer_size_kb,omitempty"`
 	lock             sync.RWMutex
 }
 
@@ -114,65 +114,87 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 	return c, nil
 }
 
-// --- handleDirectTCPIP (无改动) ---
+// ==============================================================================
+// === 性能优化点: 使用配置文件中的缓冲区大小 ===
+// ==============================================================================
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
-	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
-	globalConfig.lock.RLock(); socksServerAddr := globalConfig.SocksAddr; globalConfig.lock.RUnlock()
-	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort)); if err != nil { log.Printf("connect to SOCKS5 fail: %v", err); ch.Close(); return }
+	atomic.AddInt64(&activeConn, 1)
+	defer atomic.AddInt64(&activeConn, -1)
+
+	globalConfig.lock.RLock()
+	socksServerAddr := globalConfig.SocksAddr
+	globalConfig.lock.RUnlock()
+
+	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort))
+	if err != nil {
+		log.Printf("connect to SOCKS5 fail: %v", err)
+		ch.Close()
+		return
+	}
 	defer socksConn.Close()
-	done := make(chan struct{}, 2); go func() { io.Copy(socksConn, ch); socksConn.Close(); done <- struct{}{} }(); go func() { io.Copy(ch, socksConn); ch.Close(); done <- struct{}{} }(); <-done
+
+	bufferPool := sync.Pool{
+		New: func() interface{} {
+			// 关键改动: 根据配置文件的值来创建缓冲区
+			// 将KB转换为Bytes (KB * 1024)
+			b := make([]byte, globalConfig.BufferSizeKB*1024)
+			return &b
+		},
+	}
+	
+	done := make(chan struct{})
+
+	go func() {
+		bufPtr := bufferPool.Get().(*[]byte)
+		defer func() {
+			bufferPool.Put(bufPtr)
+			if tcpConn, ok := socksConn.(*net.TCPConn); ok {
+				tcpConn.CloseWrite()
+			}
+			close(done)
+		}()
+		io.CopyBuffer(socksConn, ch, *bufPtr)
+	}()
+
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer func() {
+		bufferPool.Put(bufPtr)
+		ch.CloseWrite()
+	}()
+	io.CopyBuffer(ch, socksConn, *bufPtr)
+	
+	<-done
 }
 
 type combinedConn struct { net.Conn; reader io.Reader }
 func (c *combinedConn) Read(p []byte) (n int, err error) { return c.reader.Read(p) }
 
-
-// ==============================================================================
-// === 核心修改点: 使用配置文件中的超时时间和UA ===
-// ==============================================================================
+// --- httpHandshake (无改动) ---
 func httpHandshake(conn net.Conn) (net.Conn, error) {
-	// 从全局配置中读取超时时间和UA
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(conn)
-
 	for {
-		// 为本次读取操作设置超时
-		if err := conn.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
-			return nil, fmt.Errorf("failed to set read deadline: %v", err)
-		}
-
-		// 尝试读取一个完整的HTTP请求
+		if err := conn.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return nil, fmt.Errorf("failed to set read deadline: %v", err) }
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				return nil, fmt.Errorf("handshake timeout: no correct payload received within %v", timeoutDuration)
-			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() { return nil, fmt.Errorf("handshake timeout: no correct payload received within %v", timeoutDuration) }
 			return nil, fmt.Errorf("read http request fail: %v", err)
 		}
-
 		io.Copy(ioutil.Discard, req.Body)
 		req.Body.Close()
-
-		// 使用配置中的UA进行验证
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-			if err != nil {
-				return nil, fmt.Errorf("write http response fail: %v", err)
-			}
-			// 握手成功，清除超时设置
+			if err != nil { return nil, fmt.Errorf("write http response fail: %v", err) }
 			conn.SetReadDeadline(time.Time{})
 			return &combinedConn{ Conn: conn, reader: io.MultiReader(reader, conn), }, nil
 		} else {
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Sending 200 OK and waiting.", conn.RemoteAddr(), req.UserAgent())
 			_, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
-			if err != nil {
-				return nil, fmt.Errorf("write fake 200 OK response fail: %v", err)
-			}
+			if err != nil { return nil, fmt.Errorf("write fake 200 OK response fail: %v", err) }
 		}
 	}
 }
-
 
 // --- 主连接处理器 (无改动) ---
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
@@ -237,16 +259,13 @@ func main() {
 	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少必要配置项") }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 
-	// 新增逻辑: 检查并设置握手超时时间的默认值
-	if globalConfig.HandshakeTimeout <= 0 {
-		globalConfig.HandshakeTimeout = 3 // 默认3秒
-	}
-	// 新增逻辑: 检查并设置连接UA的默认值
-	if globalConfig.ConnectUA == "" {
-		globalConfig.ConnectUA = "26.4.0" // 默认UA
-	}
-	log.Printf("Handshake config: timeout=%ds, required UA='%s'", globalConfig.HandshakeTimeout, globalConfig.ConnectUA)
+	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 3 }
+	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
+	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 64 }
 
+	log.Printf("Handshake config: timeout=%ds, required UA='%s'", globalConfig.HandshakeTimeout, globalConfig.ConnectUA)
+	log.Printf("Forwarding buffer size set to %d KB", globalConfig.BufferSizeKB)
+	
 	go func() {
 		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler)
 		mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler))
