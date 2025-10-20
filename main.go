@@ -13,22 +13,30 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync" // [1] 新增：引入 sync 包用于读写锁
 	"sync/atomic"
+	"time" // [2] 新增：引入 time 包用于日期比较
 )
 
 import "golang.org/x/crypto/ssh"
 
 // ==============================================================================
-// === 核心修改点 1: 修改 Config 结构体以支持多账户 ===
+// === 核心修改点 1: 定义新的 AccountInfo 和 Config 结构体 ===
 // ==============================================================================
 
+// AccountInfo 存储每个用户的详细信息
+type AccountInfo struct {
+	Password   string `json:"password"`
+	Enabled    bool   `json:"enabled"`
+	ExpiryDate string `json:"expiry_date"` // 格式: "YYYY-MM-DD"
+}
+
+// Config 结构体现在使用 AccountInfo
 type Config struct {
-	ListenAddr string            `json:"listen_addr"`
-	SocksAddr  string            `json:"socks_addr"`
-	// 不再使用 SshUser 和 SshPass
-	// SshUser    string `json:"ssh_user"`
-	// SshPass    string `json:"ssh_pass"`
-	Accounts   map[string]string `json:"accounts"` // 使用 map 来存储 "用户名": "密码"
+	ListenAddr string                 `json:"listen_addr"`
+	SocksAddr  string                 `json:"socks_addr"`
+	Accounts   map[string]AccountInfo `json:"accounts"`
+	lock       sync.RWMutex           // [3] 新增：读写锁，为将来的热重载做准备
 }
 
 var globalConfig *Config
@@ -55,19 +63,19 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
-	socksConn, err := socks5Connect(globalConfig.SocksAddr, destHost, uint16(destPort))
-	if err != nil {
-		log.Printf("connect to SOCKS5 fail: %v", err)
-		ch.Close()
-		return
-	}
+	
+	globalConfig.lock.RLock() // 加读锁以安全地读取配置
+	socksServerAddr := globalConfig.SocksAddr
+	globalConfig.lock.RUnlock()
+
+	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort))
+	if err != nil { log.Printf("connect to SOCKS5 fail: %v", err); ch.Close(); return }
 	defer socksConn.Close()
 	done := make(chan struct{}, 2)
 	go func() { io.Copy(socksConn, ch); socksConn.Close(); done <- struct{}{} }()
 	go func() { io.Copy(ch, socksConn); ch.Close(); done <- struct{}{} }()
 	<-done
 }
-
 
 // httpHandshake (无任何改动)
 type combinedConn struct {
@@ -95,39 +103,61 @@ func httpHandshake(conn net.Conn) (net.Conn, error) {
 // main 函数
 func main() {
 	configFile, err := os.ReadFile("config.json")
-	if err != nil {
-		log.Fatalf("FATAL: 无法读取 config.json 文件: %v", err)
-	}
+	if err != nil { log.Fatalf("FATAL: 无法读取 config.json 文件: %v", err) }
 	
 	globalConfig = &Config{}
 	err = json.Unmarshal(configFile, globalConfig)
-	if err != nil {
-		log.Fatalf("FATAL: 解析 config.json 文件失败: %v", err)
-	}
+	if err != nil { log.Fatalf("FATAL: 解析 config.json 文件失败: %v", err) }
 	
-	// ==============================================================================
-	// === 核心修改点 2: 修改配置验证逻辑 ===
-	// ==============================================================================
 	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.Accounts) == 0 {
 		log.Fatalf("FATAL: config.json 文件中缺少必要的配置项 (listen_addr, socks_addr, 或 accounts 列表为空)")
 	}
 
 	// ==============================================================================
-	// === 核心修改点 3: 修改 SSH 密码验证回调，以支持多账户 ===
+	// === 核心修改点 2: 升级 PasswordCallback 以检查 enabled 和 expiry_date ===
 	// ==============================================================================
 	config := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
-			// 从 accounts map 中查找用户
-			storedPassword, userExists := globalConfig.Accounts[c.User()]
 			
-			// 检查用户是否存在，以及密码是否匹配
-			if userExists && string(p) == storedPassword {
-				log.Printf("Auth successful for user: %s", c.User())
-				return nil, nil // 认证成功
+			globalConfig.lock.RLock() // 加读锁以安全地读取配置
+			accountInfo, userExists := globalConfig.Accounts[c.User()]
+			globalConfig.lock.RUnlock()
+
+			// 1. 检查用户是否存在
+			if !userExists {
+				log.Printf("Auth failed: user '%s' not found.", c.User())
+				return nil, fmt.Errorf("invalid credentials")
 			}
 
-			log.Printf("Auth failed for user: %s", c.User())
-			return nil, fmt.Errorf("invalid credentials") // 认证失败
+			// 2. 检查账户是否被禁用
+			if !accountInfo.Enabled {
+				log.Printf("Auth failed: user '%s' is disabled.", c.User())
+				return nil, fmt.Errorf("invalid credentials")
+			}
+
+			// 3. 检查账户是否过期
+			// 如果 expiry_date 字段为空，则永不过期
+			if accountInfo.ExpiryDate != "" {
+				expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate)
+				if err != nil {
+					log.Printf("Auth failed: could not parse expiry date for user '%s'. Please check format (YYYY-MM-DD).", c.User())
+					return nil, fmt.Errorf("invalid credentials")
+				}
+				// 检查是否在有效期内 (有效期当天也算有效)
+				if time.Now().After(expiry.Add(24 * time.Hour)) {
+					log.Printf("Auth failed: user '%s' has expired (expiry date: %s).", c.User(), accountInfo.ExpiryDate)
+					return nil, fmt.Errorf("invalid credentials")
+				}
+			}
+
+			// 4. 检查密码是否匹配
+			if string(p) == accountInfo.Password {
+				log.Printf("Auth successful for user: '%s'", c.User())
+				return nil, nil // 所有检查通过，认证成功
+			}
+
+			log.Printf("Auth failed: incorrect password for user '%s'", c.User())
+			return nil, fmt.Errorf("invalid credentials") // 密码错误
 		},
 	}
 	
@@ -136,60 +166,34 @@ func main() {
 	config.AddHostKey(privateKey)
 
 	l, err := net.Listen("tcp", globalConfig.ListenAddr)
-	if err != nil {
-		log.Fatalf("listen fail: %v", err)
-	}
+	if err != nil { log.Fatalf("listen fail: %v", err) }
 	log.Printf("Listening on %s, forwarding to SOCKS5 %s", globalConfig.ListenAddr, globalConfig.SocksAddr)
 
 	for {
 		conn, err := l.Accept()
-		if err != nil {
-			log.Printf("accept fail: %v", err)
-			continue
-		}
+		if err != nil { log.Printf("accept fail: %v", err); continue }
 
 		go func(c net.Conn) {
 			atomic.AddInt64(&activeConn, 1)
 			defer atomic.AddInt64(&activeConn, -1)
 			handshakedConn, err := httpHandshake(c)
-			if err != nil {
-				log.Printf("http handshake failed: %v", err)
-				c.Close()
-				return
-			}
+			if err != nil { log.Printf("http handshake failed: %v", err); c.Close(); return }
 			log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
 			sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, config)
-			if err != nil {
-				// 认证失败的日志会在这里打印
-				log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err)
-				c.Close()
-				return
-			}
+			if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); c.Close(); return }
 			defer sshConn.Close()
-			log.Printf("Phase 2: SSH handshake success from %s for user %s", sshConn.RemoteAddr(), sshConn.User())
+			log.Printf("Phase 2: SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
 			go ssh.DiscardRequests(reqs)
 
 			for newChan := range chans {
 				if newChan.ChannelType() != "direct-tcpip" {
-					newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed")
-					continue
+					newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed"); continue
 				}
-				ch, _, err := newChan.Accept()
-				if err != nil { log.Printf("accept channel fail: %v", err); continue }
-				var payload struct {
-					Host       string
-					Port       uint32
-					OriginAddr string
-					OriginPort uint32
-				}
-				if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil {
-					log.Printf("bad payload: %v", err)
-					ch.Close()
-					continue
-				}
+				ch, _, err := newChan.Accept(); if err != nil { log.Printf("accept channel fail: %v", err); continue }
+				var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
+				if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
 				go handleDirectTCPIP(ch, payload.Host, payload.Port)
 			}
-
 		}(conn)
 	}
 }
