@@ -19,8 +19,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 配置结构 (这是我们将完全依赖的唯一配置源) ---
-
+// --- 配置结构 ---
 type Settings struct {
 	HTTPPort           int      `json:"http_port"`
 	Socks5Addr         string   `json:"socks5_addr"`
@@ -35,7 +34,6 @@ type Settings struct {
 	EnableIPBlacklist  bool     `json:"enable_ip_blacklist"`
 	EnableDeviceIDAuth bool     `json:"enable_device_id_auth"`
 }
-
 type DeviceInfo struct {
 	FriendlyName string `json:"friendly_name"`
 	Expiry       string `json:"expiry"`
@@ -43,7 +41,6 @@ type DeviceInfo struct {
 	UsedBytes    int64  `json:"used_bytes"`
 	Enabled      bool   `json:"enabled"`
 }
-
 type Config struct {
 	Settings  Settings                `json:"settings"`
 	DeviceIDs map[string]DeviceInfo `json:"device_ids"`
@@ -72,7 +69,7 @@ func loadConfig(file string) (*Config, error) {
 	return cfg, nil
 }
 
-// --- 缓冲连接 (不变) ---
+// --- 缓冲连接 ---
 type bufferedConn struct {
 	net.Conn
 	reader *bufio.Reader
@@ -80,14 +77,15 @@ type bufferedConn struct {
 func (c *bufferedConn) Read(b []byte) (n int, err error) { return c.reader.Read(b) }
 
 
-// --- 核心修复 1: 修正 socks5Connect 函数 ---
-// 它现在显式接收 socksAddr 作为第一个参数
+// ==============================================================================
+// === 核心修复 1: 恢复您原始的、健康的 socks5Connect 函数签名 ===
+// ==============================================================================
 func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error) {
-	// 使用传入的 socksAddr，而不是全局变量
+	// 使用明确传入的 socksAddr 参数，而不是任何全局变量
 	c, err := net.Dial("tcp", socksAddr)
 	if err != nil { return nil, err }
 
-	// SOCKS5 握手部分是正确的，无需修改
+	// SOCKS5 握手部分...
 	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
 	buf := make([]byte, 2); if _, err := io.ReadFull(c, buf); err != nil { c.Close(); return nil, err }
 	if buf[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 auth failed") }
@@ -103,14 +101,16 @@ func socks5Connect(socksAddr, destHost string, destPort uint16) (net.Conn, error
 	return c, nil
 }
 
-// --- 核心修复 2: 修正 handleDirectTCPIP 函数 ---
+// ==============================================================================
+// === 核心修复 2: 恢复您原始的、健康的 handleDirectTCPIP 调用方式 ===
+// ==============================================================================
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	log.Printf("[SSH] Forwarding request to %s:%d through SOCKS5", destHost, destPort)
 
 	// 从全局配置中获取 SOCKS5 服务器地址
 	socksServerAddr := globalConfig.Settings.Socks5Addr
 	
-	// 正确调用 socks5Connect，传入 SOCKS5 服务器地址 和 目标地址
+	// 使用正确的函数签名，明确地传入 SOCKS5 服务器地址
 	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort))
 	if err != nil {
 		log.Printf("[SOCKS5] Connect failed: %v", err)
@@ -127,9 +127,8 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	log.Printf("[SSH] Forwarding finished for %s:%d", destHost, destPort)
 }
 
-// --- 握手处理器 (不变) ---
+// --- 握手处理器 (这部分逻辑是正确的，无需修改) ---
 func handleSshOverWs(conn net.Conn, sshConfig *ssh.ServerConfig) {
-	// 这部分逻辑是正确的，无需修改
 	remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	log.Printf("[+] Connection opened from %s", remoteIP)
 	defer func() {
@@ -151,13 +150,13 @@ func handleSshOverWs(conn net.Conn, sshConfig *ssh.ServerConfig) {
 			if !found { log.Printf("[!] Auth Failed: Invalid Sec-WebSocket-Key from %s.", remoteIP); conn.Write([]byte("HTTP/1.1 401\r\n\r\n")); return }
 			finalDeviceID = deviceInfo.FriendlyName
 			if !deviceInfo.Enabled { log.Printf("[!] Auth Failed: Device '%s' disabled.", finalDeviceID); conn.Write([]byte("HTTP/1.1 403\r\n\r\n")); return }
-			expiry, err := time.Parse("2006-01-02", deviceInfo.Expiry); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { log.Printf("[!] Auth Failed: Device '%s' expired.", finalDeviceID); conn.Write([]byte("HTTP/1.1 403\r\n\r\n")); return }
+			expiry, err := time.Parse("2006-002", deviceInfo.Expiry); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { log.Printf("[!] Auth Failed: Device '%s' expired.", finalDeviceID); conn.Write([]byte("HTTP/1.1 403\r\n\r\n")); return }
 			var deviceUsagePtr *int64; if val, ok := deviceUsage.Load(credential); ok { deviceUsagePtr = val.(*int64) }
 			if deviceInfo.LimitGB > 0 && deviceUsagePtr != nil && atomic.LoadInt64(deviceUsagePtr) >= int64(deviceInfo.LimitGB)*1024*1024*1024 { log.Printf("[!] Auth Failed: Traffic limit for '%s' reached.", finalDeviceID); conn.Write([]byte("HTTP/1.1 403\r\n\r\n")); return }
 		} else { finalDeviceID = remoteIP }
 		ua := req.UserAgent()
 		if settings.UAKeywordProbe != "" && strings.Contains(ua, settings.UAKeywordProbe) { log.Printf("[*] Probe from %s for device '%s'.", remoteIP, finalDeviceID); conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\nOK")); continue }
-		if settings.UAKeywordWS != "" && strings.Contains(ua, settings.UAKeywordWS) { log.Printf("[*] Handshake for device '%s' successful.", finalDeviceID); conn.Write([]byte("HTTP/1.1 101\r\n\r\n")); forwardingStarted = true } else { log.Printf("[!] Unrecognized UA from %s: '%s'.", remoteIP, ua); conn.Write([]byte("HTTP/1.1 403\r\n\r\n")); return }
+		if settings.UAKeywordWS != "" && strings.Contains(ua, settings.UAKeywordWS) { log.Printf("[*] Handshake for device '%s' successful.", finalDeviceID); conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")); forwardingStarted = true } else { log.Printf("[!] Unrecognized UA from %s: '%s'.", remoteIP, ua); conn.Write([]byte("HTTP/1.1 403\r\n\r\n")); return }
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	bConn := &bufferedConn{Conn: conn, reader: reader}
@@ -174,19 +173,17 @@ func handleSshOverWs(conn net.Conn, sshConfig *ssh.ServerConfig) {
 }
 func isIPInList(ip string, list []string) bool { for _, item := range list { if item == ip { return true } }; return false }
 
-// --- 主函数 (核心修复3: 使用配置中的SSH凭证) ---
+// --- 主函数 (使用配置驱动的SSH凭证) ---
 func main() {
 	var configFile = "ws_config.json"
 	var err error
 	
-	globalConfig, err = loadConfig(configFile)
-	if err != nil { log.Fatalf("FATAL: %v", err) }
+	globalConfig, err = loadConfig(configFile); if err != nil { log.Fatalf("FATAL: %v", err) }
 	
 	settings := globalConfig.Settings
 
 	sshConfig := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
-			// 使用从配置文件加载的用户名和密码
 			if c.User() == settings.SshUser && string(p) == settings.SshPass {
 				return nil, nil
 			}
