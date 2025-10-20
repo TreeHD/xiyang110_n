@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
+
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,9 +22,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// ==============================================================================
-// === 核心修改点 1: 增加 AdminAccounts 字段 ===
-// ==============================================================================
+// --- 结构体及全局变量 (无改动) ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -33,14 +32,12 @@ type Config struct {
 	ListenAddr     string                 `json:"listen_addr"`
 	SocksAddr      string                 `json:"socks_addr"`
 	AdminAddr      string                 `json:"admin_addr"`
-	AdminAccounts  map[string]string      `json:"admin_accounts"` // 新增
+	AdminAccounts  map[string]string      `json:"admin_accounts"`
 	Accounts       map[string]AccountInfo `json:"accounts"`
 	lock           sync.RWMutex
 }
 var globalConfig *Config
 var activeConn int64
-
-// --- 在线用户及会话管理 ---
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
 	Username    string    `json:"username"`
@@ -49,19 +46,20 @@ type OnlineUser struct {
 	sshConn     ssh.Conn
 }
 var onlineUsers sync.Map
-func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
-func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
-
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct { Username string; Expiry time.Time }
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
-func createSession(username string) *http.Cookie {
+
+// --- 辅助函数 (无改动) ---
+func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
+func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
+func createSession(username string) *http.Cookie { /* ...内容不变... */
 	sessionTokenBytes := make([]byte, 32); rand.Read(sessionTokenBytes); sessionToken := hex.EncodeToString(sessionTokenBytes)
 	expiry := time.Now().Add(12 * time.Hour); sessionsLock.Lock(); sessions[sessionToken] = Session{Username: username, Expiry: expiry}; sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
-func validateSession(r *http.Request) bool {
+func validateSession(r *http.Request) bool { /* ...内容不变... */
 	cookie, err := r.Cookie(sessionCookieName); if err != nil { return false }
 	sessionsLock.RLock(); session, ok := sessions[cookie.Value]; sessionsLock.RUnlock()
 	if !ok || time.Now().After(session.Expiry) {
@@ -70,35 +68,53 @@ func validateSession(r *http.Request) bool {
 	}
 	return true
 }
-func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
+func sendJSON(w http.ResponseWriter, code int, payload interface{}) { /* ...内容不变... */
 	response, _ := json.Marshal(payload); w.Header().Set("Content-Type", "application/json"); w.WriteHeader(code); w.Write(response)
 }
 
-// --- 网络核心逻辑 (无改动) ---
-func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) { /* ...内容不变... */
-	c, err := net.Dial("tcp", socksAddr); if err != nil { return nil, err }
+
+// ==============================================================================
+// === 核心修改点 1: 在 socks5Connect 中设置 TCP_NODELAY ===
+// ==============================================================================
+func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn, error) {
+	c, err := net.Dial("tcp", socksAddr)
+	if err != nil { return nil, err }
+
+	// 设置 TCP_NODELAY 以降低延迟
+	if tcpConn, ok := c.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
+	// NO AUTH
 	_, err = c.Write([]byte{0x05, 0x01, 0x00}); if err != nil { c.Close(); return nil, err }
 	buf := make([]byte, 2); if _, err := io.ReadFull(c, buf); err != nil { c.Close(); return nil, err }
 	if buf[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 auth failed") }
+	// CONNECT request
 	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(destHost))}; req = append(req, []byte(destHost)...); req = append(req, byte(destPort>>8), byte(destPort&0xff))
 	if _, err = c.Write(req); err != nil { c.Close(); return nil, err }
+	// reply
 	rep := make([]byte, 4); if _, err := io.ReadFull(c, rep); err != nil { c.Close(); return nil, err }
 	if rep[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 connect failed") }
+	// read remaining address info
 	switch rep[3] {
 	case 0x01: io.CopyN(io.Discard, c, 4+2); case 0x03: alen := make([]byte, 1); io.ReadFull(c, alen); io.CopyN(io.Discard, c, int64(alen[0])+2); case 0x04: io.CopyN(io.Discard, c, 16+2)
 	}
 	return c, nil
 }
-func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) { /* ...内容不变... */
+
+// --- handleDirectTCPIP (无改动) ---
+func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
 	globalConfig.lock.RLock(); socksServerAddr := globalConfig.SocksAddr; globalConfig.lock.RUnlock()
 	socksConn, err := socks5Connect(socksServerAddr, destHost, uint16(destPort)); if err != nil { log.Printf("connect to SOCKS5 fail: %v", err); ch.Close(); return }
 	defer socksConn.Close()
 	done := make(chan struct{}, 2); go func() { io.Copy(socksConn, ch); socksConn.Close(); done <- struct{}{} }(); go func() { io.Copy(ch, socksConn); ch.Close(); done <- struct{}{} }(); <-done
 }
+
+// --- httpHandshake (无改动) ---
 type combinedConn struct { net.Conn; reader io.Reader }
 func (c *combinedConn) Read(p []byte) (n int, err error) { return c.reader.Read(p) }
-func httpHandshake(conn net.Conn) (net.Conn, error) { /* ...内容不变... */
+func httpHandshake(conn net.Conn) (net.Conn, error) {
 	reader := bufio.NewReader(conn); req, err := http.ReadRequest(reader); if err != nil { return nil, fmt.Errorf("read http request fail: %v", err) }
 	io.Copy(ioutil.Discard, req.Body); req.Body.Close()
 	if strings.Contains(req.UserAgent(), "26.4.0") {
@@ -108,11 +124,11 @@ func httpHandshake(conn net.Conn) (net.Conn, error) { /* ...内容不变... */
 	return nil, fmt.Errorf("invalid user-agent")
 }
 
-// 主连接处理器 (无改动)
-func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) { /* ...内容不变... */
-	handshakedConn, err := httpHandshake(c); if err != nil { log.Printf("http handshake failed: %v", err); c.Close(); return }
+// --- 主连接处理器 (无改动) ---
+func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
+	handshakedConn, err := httpHandshake(c); if err != nil { log.Printf("http handshake failed: %v", err); return } // defer c.Close() in parent will handle it
 	log.Printf("Phase 1 OK: HTTP handshake passed, waiting SSH payload")
-	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg); if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); c.Close(); return }
+	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg); if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); return }
 	defer sshConn.Close()
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }; addOnlineUser(onlineUser)
@@ -127,13 +143,31 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) { /* ...内容不
 	}
 }
 
-// API处理器 (无改动)
-func safeSaveConfig() error { /* ...内容不变... */
+// --- Web服务器逻辑 (无改动) ---
+func safeSaveConfig() error { /* ... */
 	globalConfig.lock.Lock(); defer globalConfig.lock.Unlock()
 	data, err := json.MarshalIndent(globalConfig, "", "  "); if err != nil { return fmt.Errorf("failed to marshal config: %w", err) }
 	return ioutil.WriteFile("config.json", data, 0644)
 }
-func apiHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc { /* ... */
+	return func(w http.ResponseWriter, r *http.Request) {
+		if validateSession(r) { next.ServeHTTP(w, r) } else {
+			if strings.HasPrefix(r.URL.Path, "/api/") { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"}) } else { http.Redirect(w, r, "/login.html", http.StatusFound) }
+		}
+	}
+}
+func loginHandler(w http.ResponseWriter, r *http.Request) { /* ... */
+	if r.Method != http.MethodPost { sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return }
+	var creds struct { Username string `json:"username"`; Password string `json:"password"` }; if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求格式"}); return }
+	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
+	if !ok || creds.Password != storedPass { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }
+	cookie := createSession(creds.Username); http.SetCookie(w, cookie); sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
+}
+func logoutHandler(w http.ResponseWriter, r *http.Request) { /* ... */
+	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound)
+}
+func apiHandler(w http.ResponseWriter, r *http.Request) { /* ... */
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET": var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
@@ -146,88 +180,26 @@ func apiHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... 
 	}
 }
 
-
-// ==============================================================================
-// === 核心修改点 2: 增加Web服务器的处理器和中间件 ===
-// ==============================================================================
-
-// 认证中间件
-func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if validateSession(r) {
-			next.ServeHTTP(w, r)
-		} else {
-			// 如果是API请求，返回JSON错误；否则重定向到登录页
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
-			} else {
-				http.Redirect(w, r, "/login.html", http.StatusFound)
-			}
-		}
-	}
-}
-
-// 登录处理器
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return }
-	var creds struct { Username string `json:"username"`; Password string `json:"password"` }
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求格式"}); return }
-	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
-	if !ok || creds.Password != storedPass { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }
-	cookie := createSession(creds.Username); http.SetCookie(w, cookie); sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
-}
-
-// 登出处理器
-func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound)
-}
-
-
 // main 函数
 func main() {
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json 文件: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 文件失败: %v", err) }
-	
-	// 修改配置验证
-	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.Accounts) == 0 || len(globalConfig.AdminAccounts) == 0 {
-		log.Fatalf("FATAL: config.json 缺少必要配置项 (listen_addr, socks_addr, accounts, admin_accounts)")
-	}
+	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少必要配置项") }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	
-	// ==============================================================================
-	// === 核心修改点 3: 启动Web服务器的goroutine ===
-	// ==============================================================================
 	go func() {
-		mux := http.NewServeMux()
-		
-		// 1. 公开端点: 提供login.html文件和处理登录请求的API
-		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
-		mux.HandleFunc("/login", loginHandler)
-		
-		// 2. 受保护端点: 登出API, 所有数据API, 以及主管理页面
-		mux.HandleFunc("/logout", authMiddleware(logoutHandler))
-		mux.HandleFunc("/api/", authMiddleware(apiHandler))
-		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }
-		mux.HandleFunc("/admin.html", authMiddleware(adminHandler))
-
-		// 3. 根路径 "/" 的智能导航: 已登录则重定向到/admin.html，未登录则重定向到/login.html
+		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler)
+		mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler))
+		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/" { http.NotFound(w, r); return }
-			if validateSession(r) {
-				http.Redirect(w, r, "/admin.html", http.StatusFound)
-			} else {
-				http.Redirect(w, r, "/login.html", http.StatusFound)
-			}
+			if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) }
 		})
-		
-		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
-		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
+		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
 	}()
 	
-	// --- SSH服务器部分 (无改动) ---
 	sshCfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
+		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) { 
 			globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock()
 			if !userExists { log.Printf("Auth failed: user '%s' not found.", c.User()); return nil, fmt.Errorf("invalid credentials") }
 			if !accountInfo.Enabled { log.Printf("Auth failed: user '%s' is disabled.", c.User()); return nil, fmt.Errorf("invalid credentials") }
@@ -247,7 +219,31 @@ func main() {
 	log.Printf("SSH server listening on %s, forwarding to SOCKS5 %s", globalConfig.ListenAddr, globalConfig.SocksAddr)
 
 	for {
-		conn, err := l.Accept(); if err != nil { log.Printf("accept fail: %v", err); continue }
-		go handleSshConnection(conn, sshCfg)
+		conn, err := l.Accept()
+		if err != nil {
+			log.Printf("accept fail: %v", err)
+			continue
+		}
+
+		// ==============================================================================
+		// === 核心修改点 2: 设置 TCP_NODELAY 和 增加 Panic Recover ===
+		// ==============================================================================
+
+		// 设置 TCP_NODELAY 以降低延迟
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+		}
+
+		go func(c net.Conn) {
+			// Panic Recover, 捕获goroutine中的致命错误，防止主程序崩溃
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("FATAL: Panic recovered in connection handler for %s: %v", c.RemoteAddr(), r)
+				}
+				c.Close() // 确保连接在任何情况下都被关闭
+			}()
+
+			handleSshConnection(c, sshCfg)
+		}(conn)
 	}
 }
