@@ -34,7 +34,7 @@ type AccountInfo struct {
 type Config struct {
 	ListenAddr          string                 `json:"listen_addr"`
 	SocksAddrs          []string               `json:"socks_addrs"`
-	UdpSocksAddr        string                 `json:"udp_socks_addr,omitempty"` // *** UDP专用SOCKS5地址 ***
+	UdpSocksAddr        string                 `json:"udp_socks_addr,omitempty"`
 	AdminAddr           string                 `json:"admin_addr"`
 	AdminAccounts       map[string]string      `json:"admin_accounts"`
 	Accounts            map[string]AccountInfo `json:"accounts"`
@@ -61,21 +61,38 @@ var proxyPool []*pooledProxy
 var poolLock sync.RWMutex
 var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024); return &b }}
 
-
 // ==============================================================================
-// === 核心升级: UDP-over-TCP 协议解析/封装辅助函数 ===
+// === 临时的、用于诊断的 readUdpOverTcpPacket 函数 ===
 // ==============================================================================
-
-// readUdpOverTcpPacket 从 reader 中解析一个包含目标地址的、封装好的数据包
 func readUdpOverTcpPacket(r io.Reader) (destAddr string, payload []byte, err error) {
 	var totalLength uint16
-	if err = binary.Read(r, binary.BigEndian, &totalLength); err != nil { return "", nil, err }
-	if totalLength < 4 { return "", nil, fmt.Errorf("invalid packet: total length %d is too short", totalLength) }
+	// 1. 读取总长度
+	if err = binary.Read(r, binary.BigEndian, &totalLength); err != nil {
+		return "", nil, err 
+	}
+
+	log.Printf("DIAGNOSTIC: Packet total length is: %d", totalLength)
+
+	// 读取整个包的内容
 	fullPacket := make([]byte, totalLength)
-	if _, err = io.ReadFull(r, fullPacket); err != nil { return "", nil, fmt.Errorf("failed to read full packet payload: %w", err) }
+	if _, err = io.ReadFull(r, fullPacket); err != nil {
+		return "", nil, fmt.Errorf("failed to read full packet payload: %w", err)
+	}
+
+	// ================== 核心诊断代码 ==================
+	// 打印出这个包的完整十六进制内容
+	log.Printf("DIAGNOSTIC: RAW PACKET HEX DUMP:\n%s", hex.Dump(fullPacket))
+	// ===============================================
+
+	if len(fullPacket) < 1 {
+		return "", nil, fmt.Errorf("packet is empty")
+	}
+
+	atyp := fullPacket[0]
+	
+	// --- 后面的代码保持原样，用于处理其他正常的包 ---
 	offset := 0
-	atyp := fullPacket[offset]
-	offset++
+	offset++ // atyp
 	var host string
 	switch atyp {
 	case 0x01: // IPv4
@@ -94,6 +111,8 @@ func readUdpOverTcpPacket(r io.Reader) (destAddr string, payload []byte, err err
 		host = net.IP(fullPacket[offset : offset+16]).String()
 		offset += 16
 	default:
+		// 主动返回错误以便我们能清晰地看到日志
+		log.Printf("DIAGNOSTIC: Detected problematic ATYP %d. Exiting for analysis.", atyp)
 		return "", nil, fmt.Errorf("unsupported atyp: %d", atyp)
 	}
 	if len(fullPacket) < offset+2 { return "", nil, fmt.Errorf("packet too short for port") }
@@ -103,6 +122,7 @@ func readUdpOverTcpPacket(r io.Reader) (destAddr string, payload []byte, err err
 	payload = fullPacket[offset:]
 	return destAddr, payload, nil
 }
+
 
 // writeFramedPacket 将一个数据包以 [2字节长度][数据] 的格式写入 writer
 func writeFramedPacket(w io.Writer, packet []byte) error {
@@ -131,10 +151,7 @@ func buildSocks5UDPRequest(destAddr string, payload []byte) ([]byte, error) {
 	return append(header, payload...), nil
 }
 
-// ==============================================================================
-// === 核心升级: SOCKS5 UDP ASSOCIATE 客户端实现 ===
-// ==============================================================================
-
+// socks5UdpAssociate 与SOCKS5服务器执行UDP ASSOCIATE命令，并返回一个可用的UDP连接
 func socks5UdpAssociate(socksAddr string) (net.PacketConn, net.Conn, *net.UDPAddr, error) {
 	tcpConn, err := net.DialTimeout("tcp", socksAddr, 5*time.Second)
 	if err != nil { return nil, nil, nil, fmt.Errorf("failed to dial socks5 server: %w", err) }
@@ -172,10 +189,7 @@ func socks5UdpAssociate(socksAddr string) (net.PacketConn, net.Conn, *net.UDPAdd
 	return udpConn, tcpConn, relayAddr, nil
 }
 
-// ==============================================================================
-// === 核心升级: 全新的UDP流量处理函数 (最终版) ===
-// ==============================================================================
-
+// handleUdpProxy 的最终版本
 func handleUdpProxy(ch ssh.Channel, sshConn ssh.Conn) {
 	defer ch.Close()
 	udpSocksAddr := globalConfig.UdpSocksAddr
@@ -453,7 +467,6 @@ func main() {
 	log.Printf("Handshake: timeout=%ds, UA='%s'. Forwarding buffer: %d KB. Idle Timeout: %ds", globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 	go func() {
 		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); 
-		// *** BUG FIX HERE ***
 		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { 
 			log.Fatalf("FATAL: 无法启动Admin panel: %v", err) 
 		}
