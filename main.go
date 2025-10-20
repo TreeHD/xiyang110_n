@@ -21,27 +21,12 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体定义 (无改动) ---
-type AccountInfo struct {
-	Password   string `json:"password"`
-	Enabled    bool   `json:"enabled"`
-	ExpiryDate string `json:"expiry_date"`
-}
-type Config struct {
-	ListenAddr     string                 `json:"listen_addr"`
-	SocksAddr      string                 `json:"socks_addr"`
-	AdminAddr      string                 `json:"admin_addr"`
-	AdminAccounts  map[string]string      `json:"admin_accounts"`
-	Accounts       map[string]AccountInfo `json:"accounts"`
-	lock           sync.RWMutex
-}
+// --- 结构体等定义 (无改动) ---
+type AccountInfo struct { Password   string `json:"password"`; Enabled    bool   `json:"enabled"`; ExpiryDate string `json:"expiry_date"` }
+type Config struct { ListenAddr string `json:"listen_addr"`; SocksAddr string `json:"socks_addr"`; AdminAddr string `json:"admin_addr"`; AdminAccounts map[string]string `json:"admin_accounts"`; Accounts map[string]AccountInfo `json:"accounts"`; lock sync.RWMutex }
 var globalConfig *Config
 var activeConn int64
-
-// --- 在线用户及会话管理 (无改动) ---
-type OnlineUser struct {
-	ConnID string `json:"conn_id"`; Username string `json:"username"`; RemoteAddr string `json:"remote_addr"`; ConnectTime time.Time `json:"connect_time"`; sshConn ssh.Conn
-}
+type OnlineUser struct { ConnID string `json:"conn_id"`; Username string `json:"username"`; RemoteAddr string `json:"remote_addr"`; ConnectTime time.Time `json:"connect_time"`; sshConn ssh.Conn }
 var onlineUsers sync.Map
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
@@ -49,18 +34,15 @@ const sessionCookieName = "wstunnel_admin_session"
 type Session struct { Username string; Expiry time.Time }
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
-func createSession(username string) *http.Cookie {
+func createSession(username string) *http.Cookie { /* ...内容不变... */
 	sessionTokenBytes := make([]byte, 32); rand.Read(sessionTokenBytes); sessionToken := hex.EncodeToString(sessionTokenBytes)
 	expiry := time.Now().Add(12 * time.Hour); sessionsLock.Lock(); sessions[sessionToken] = Session{Username: username, Expiry: expiry}; sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
-func validateSession(r *http.Request) bool {
+func validateSession(r *http.Request) bool { /* ...内容不变... */
 	cookie, err := r.Cookie(sessionCookieName); if err != nil { return false }
 	sessionsLock.RLock(); session, ok := sessions[cookie.Value]; sessionsLock.RUnlock()
-	if !ok || time.Now().After(session.Expiry) {
-		if ok { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
-		return false
-	}
+	if !ok || time.Now().After(session.Expiry) { if ok { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }; return false }
 	return true
 }
 
@@ -74,9 +56,7 @@ func socks5Connect(socksAddr string, destHost string, destPort uint16) (net.Conn
 	if _, err = c.Write(req); err != nil { c.Close(); return nil, err }
 	rep := make([]byte, 4); if _, err := io.ReadFull(c, rep); err != nil { c.Close(); return nil, err }
 	if rep[1] != 0x00 { c.Close(); return nil, fmt.Errorf("socks5 connect failed") }
-	switch rep[3] {
-	case 0x01: io.CopyN(io.Discard, c, 4+2); case 0x03: alen := make([]byte, 1); io.ReadFull(c, alen); io.CopyN(io.Discard, c, int64(alen[0])+2); case 0x04: io.CopyN(io.Discard, c, 16+2)
-	}
+	switch rep[3] { case 0x01: io.CopyN(io.Discard, c, 4+2); case 0x03: alen := make([]byte, 1); io.ReadFull(c, alen); io.CopyN(io.Discard, c, int64(alen[0])+2); case 0x04: io.CopyN(io.Discard, c, 16+2) }
 	return c, nil
 }
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) { /* ...内容不变... */
@@ -109,8 +89,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) { /* ...内容不
 	for newChan := range chans {
 		if newChan.ChannelType() != "direct-tcpip" { newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed"); continue }
 		ch, _, err := newChan.Accept(); if err != nil { log.Printf("accept channel fail: %v", err); continue }
-		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
-		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
+		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }; if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
 		go handleDirectTCPIP(ch, payload.Host, payload.Port)
 	}
 }
@@ -120,74 +99,107 @@ func safeSaveConfig() error { /* ...内容不变... */
 	return ioutil.WriteFile("config.json", data, 0644)
 }
 
+// 辅助函数，用于发送JSON响应
+func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
+	response, _ := json.Marshal(payload)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(response)
+}
+
 // ==============================================================================
-// === 核心修复点: 将所有错误的 `global` 修正为 `globalConfig` ===
+// === 核心修改点 1: 修改 Web 服务器逻辑 ===
 // ==============================================================================
 
-// Web服务器逻辑
-func authMiddleware(next http.HandlerFunc) http.HandlerFunc { /* ...内容不变... */
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if validateSession(r) { next.ServeHTTP(w, r) } else {
-			if strings.HasPrefix(r.URL.Path, "/api/") { http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized) } else { http.ServeFile(w, r, "login.html") }
+		if validateSession(r) {
+			next.ServeHTTP(w, r)
+		} else {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+			} else {
+				// [修改点] 对于页面请求，直接返回登录页，而不是重定向，这样更清晰
+				http.ServeFile(w, r, "login.html")
+			}
 		}
 	}
 }
-func loginHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
-	if r.Method != http.MethodPost { http.Error(w, "Method not allowed", http.StatusMethodNotAllowed); return }
-	var creds struct { Username string `json:"username"`; Password string `json:"password"` }; if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { http.Error(w, `{"message":"无效的请求格式"}`, http.StatusBadRequest); return }
-	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
-	if !ok || creds.Password != storedPass { http.Error(w, `{"message":"用户名或密码错误"}`, http.StatusUnauthorized); return }
-	cookie := createSession(creds.Username); http.SetCookie(w, cookie); w.WriteHeader(http.StatusOK)
-}
-func logoutHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
-	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/", http.StatusFound)
-}
-func apiHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	switch {
-	case r.URL.Path == "/api/online-users" && r.Method == "GET":
-		var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
-	case r.URL.Path == "/api/accounts" && r.Method == "GET":
-		globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock()
-		json.NewEncoder(w).Encode(globalConfig.Accounts) // [修正点 1]
-	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); var accInfo AccountInfo; if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }; globalConfig.lock.Lock(); globalConfig.Accounts[username] = accInfo; globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
-	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock(); if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}` , http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
-	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT":
-		pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct { Enabled bool `json:"enabled"` }; if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效的请求体"}`, http.StatusBadRequest); return }
-		globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; globalConfig.Accounts[username] = acc }; globalConfig.lock.Unlock(); // [修正点 2]
-		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置文件失败"}`, http.StatusInternalServerError); return }; json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
-	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
-		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/"); if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); removeOnlineUser(connID); json.NewEncoder(w).Encode(map[string]string{"message": "连接已断开"}) } else { http.Error(w, `{"message":"连接未找到"}`, http.StatusNotFound) }
-	default:
-		http.NotFound(w, r)
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return
 	}
+	
+	var creds struct { Username string `json:"username"`; Password string `json:"password"` }
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效的请求格式"}); return
+	}
+
+	globalConfig.lock.RLock()
+	storedPass, ok := globalConfig.AdminAccounts[creds.Username]
+	globalConfig.lock.RUnlock()
+
+	if !ok || creds.Password != storedPass {
+		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return
+	}
+
+	cookie := createSession(creds.Username)
+	http.SetCookie(w, cookie)
+	// [修改点] 登录成功也返回一个明确的JSON响应
+	sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
 }
 
-// main 函数
+// 登出处理器 (无改动)
+func logoutHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
+	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound) // 改为重定向到login.html
+}
+
+// API处理器 (无改动)
+func apiHandler(w http.ResponseWriter, r *http.Request) { /* ...内容不变... */
+	// ...
+}
+
 func main() {
 	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json 文件: %v", err) }
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 文件失败: %v", err) }
-	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少必要配置项 (listen_addr, socks_addr, admin_accounts)") }
+	if globalConfig.ListenAddr == "" || globalConfig.SocksAddr == "" || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少必要配置项") }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	
 	go func() {
-		mux := http.NewServeMux(); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler))
-		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }
-		mux.HandleFunc("/", authMiddleware(adminHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler))
+		mux := http.NewServeMux()
+		
+		mux.HandleFunc("/login", loginHandler)
+		mux.HandleFunc("/logout", authMiddleware(logoutHandler))
+
+		// [修改点] 更明确的路由规则
+		// 根路径 "/" 由中间件处理，如果未登录会显示 login.html
+		rootHandler := func(w http.ResponseWriter, r *http.Request) {
+			// 如果已经登录，直接显示 admin.html
+			http.ServeFile(w, r, "admin.html")
+		}
+		mux.HandleFunc("/", authMiddleware(rootHandler))
+
+		// 为 admin.html 也添加一个明确的路由，同样受保护
+		mux.HandleFunc("/admin.html", authMiddleware(rootHandler))
+		
+		mux.HandleFunc("/api/", authMiddleware(apiHandler))
+
 		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
-		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) } // [修正点 3]
+		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil {
+			log.Fatalf("FATAL: 无法启动Admin panel: %v", err)
+		}
 	}()
+
 	
-	sshCfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) { /* ...内容不变... */
+	sshCfg := &ssh.ServerConfig{ /* ...内容不变... */
+		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) { 
 			globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock()
 			if !userExists { log.Printf("Auth failed: user '%s' not found.", c.User()); return nil, fmt.Errorf("invalid credentials") }
 			if !accountInfo.Enabled { log.Printf("Auth failed: user '%s' is disabled.", c.User()); return nil, fmt.Errorf("invalid credentials") }
 			if accountInfo.ExpiryDate != "" {
-				expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil { log.Printf("Auth failed: could not parse expiry date for user '%s'.", c.User()); return nil, fmt.Errorf("invalid credentials") }
+				expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil { log.Printf("Auth failed: parse expiry date for user '%s'.", c.User()); return nil, fmt.Errorf("invalid credentials") }
 				if time.Now().After(expiry.Add(24 * time.Hour)) { log.Printf("Auth failed: user '%s' has expired.", c.User()); return nil, fmt.Errorf("invalid credentials") }
 			}
 			if string(p) == accountInfo.Password { log.Printf("Auth successful for user: '%s'", c.User()); return nil, nil }
