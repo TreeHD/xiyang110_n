@@ -13,6 +13,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// udpConnections 跟踪每个客户端的UDP连接
 var udpConnections = struct {
 	sync.RWMutex
 	m map[string]net.PacketConn
@@ -24,12 +25,6 @@ func addConn(clientKey string, conn net.PacketConn) {
 	udpConnections.Lock()
 	defer udpConnections.Unlock()
 	udpConnections.m[clientKey] = conn
-}
-
-func getConn(clientKey string) net.PacketConn {
-	udpConnections.RLock()
-	defer udpConnections.RUnlock()
-	return udpConnections.m[clientKey]
 }
 
 func delConn(clientKey string) {
@@ -63,6 +58,8 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 	go func() {
 		defer close(done)
 		for {
+			// 协议格式: [2字节总长度][4字节目标IPv4地址][2字节目标端口][UDP真实数据]
+
 			// 1. 读取2字节的总长度
 			lenBytes := make([]byte, 2)
 			if _, err := io.ReadFull(ch, lenBytes); err != nil {
@@ -70,12 +67,12 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 			}
 			totalLen := int(binary.BigEndian.Uint16(lenBytes))
 
-			// 2. 读取剩余的全部数据
-			if totalLen < 6 { // 至少要有 IP(4) + Port(2)
-				log.Printf("Final UDP Proxy: Invalid packet length %d from %s", totalLen, clientKey)
+			if totalLen < 6 { // 长度至少要包含 IP(4) + Port(2)
+				log.Printf("Custom UDP Proxy: Invalid packet length %d from %s. Closing session.", totalLen, clientKey)
 				return
 			}
-			
+
+			// 2. 读取剩余的全部数据
 			data := make([]byte, totalLen)
 			if _, err := io.ReadFull(ch, data); err != nil {
 				return
@@ -90,7 +87,7 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 
 			// 4. 发送UDP包
 			if _, err := udpConn.WriteTo(payload, destAddr); err != nil {
-				// 忽略错误，继续处理下一个包
+				// 忽略单个包的发送错误，继续处理下一个
 			}
 		}
 	}()
@@ -111,13 +108,15 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
+				// 真正的错误发生，让Goroutine 1退出
+				ch.Close()
 				return
 			}
 			
 			udpRemote := remote.(*net.UDPAddr)
 			remoteIP := udpRemote.IP.To4()
 			if remoteIP == nil {
-				continue // 只处理IPv4
+				continue // 只处理IPv4回包
 			}
 
 			// 封装回包: [2字节总长][4字节源IP][2字节源端口][数据]
