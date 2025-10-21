@@ -1,4 +1,4 @@
-// final_udp_handler.go
+// socks5_udp_handler.go
 package main
 
 import (
@@ -41,15 +41,16 @@ func delConn(clientKey string) {
 	}
 }
 
-func handleFinalUDP(ch ssh.Channel, remoteAddr net.Addr) {
+// handleSocks5UDP 的最终实现，匹配客户端的真实协议
+func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
-	log.Printf("Final UDP Proxy: New session for %s", clientKey)
-	defer log.Printf("Final UDP Proxy: Session for %s closed", clientKey)
+	log.Printf("Custom UDP Proxy: New session for %s", clientKey)
+	defer log.Printf("Custom UDP Proxy: Session for %s closed", clientKey)
 	defer ch.Close()
 
 	udpConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
-		log.Printf("Final UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
+		log.Printf("Custom UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
 		return
 	}
 	defer udpConn.Close()
@@ -67,14 +68,14 @@ func handleFinalUDP(ch ssh.Channel, remoteAddr net.Addr) {
 			if _, err := io.ReadFull(ch, lenBytes); err != nil {
 				return
 			}
-			totalLen := binary.BigEndian.Uint16(lenBytes)
+			totalLen := int(binary.BigEndian.Uint16(lenBytes))
 
+			// 2. 读取剩余的全部数据
 			if totalLen < 6 { // 至少要有 IP(4) + Port(2)
 				log.Printf("Final UDP Proxy: Invalid packet length %d from %s", totalLen, clientKey)
 				return
 			}
-
-			// 2. 读取剩余的全部数据
+			
 			data := make([]byte, totalLen)
 			if _, err := io.ReadFull(ch, data); err != nil {
 				return
@@ -89,7 +90,7 @@ func handleFinalUDP(ch ssh.Channel, remoteAddr net.Addr) {
 
 			// 4. 发送UDP包
 			if _, err := udpConn.WriteTo(payload, destAddr); err != nil {
-				log.Printf("Final UDP Proxy: Error writing to %s for %s: %v", destAddr, clientKey, err)
+				// 忽略错误，继续处理下一个包
 			}
 		}
 	}()
