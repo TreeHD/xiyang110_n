@@ -14,61 +14,83 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var targetAddrMap = struct {
+// clientState 用于存储每个客户端会话的状态
+type clientState struct {
+	udpConn    net.PacketConn    // 每个客户端独享一个UDP套接字
+	targetAddr *net.UDPAddr      // 客户端指定的目标地址
+	sshChan    ssh.Channel       // 回传数据的SSH通道
+	done       chan struct{}       // 用于同步关闭的channel
+	key        string            // 客户端的唯一标识
+}
+
+// clientManager 统一管理所有客户端会话
+var clientManager = struct {
 	sync.RWMutex
-	m map[string]*net.UDPAddr
+	clients map[string]*clientState
 }{
-	m: make(map[string]*net.UDPAddr),
+	clients: make(map[string]*clientState),
 }
 
-func setTargetAddr(clientKey string, addr *net.UDPAddr) {
-	targetAddrMap.Lock()
-	defer targetAddrMap.Unlock()
-	targetAddrMap.m[clientKey] = addr
+func (cm *clientManager) Add(key string, state *clientState) {
+	cm.Lock()
+	defer cm.Unlock()
+	cm.clients[key] = state
 }
 
-func getTargetAddr(clientKey string) *net.UDPAddr {
-	targetAddrMap.RLock()
-	defer targetAddrMap.RUnlock()
-	return targetAddrMap.m[clientKey]
+func (cm *clientManager) Get(key string) *clientState {
+	cm.RLock()
+	defer cm.RUnlock()
+	return cm.clients[key]
 }
 
-func delTargetAddr(clientKey string) {
-	targetAddrMap.Lock()
-	defer targetAddrMap.Unlock()
-	delete(targetAddrMap.m, clientKey)
+func (cm *clientManager) Delete(key string) {
+	cm.Lock()
+	defer cm.Unlock()
+	if state, ok := cm.clients[key]; ok {
+		state.udpConn.Close() // 关闭UDP连接
+		delete(cm.clients, key)
+	}
 }
 
+// handleUdpGw 严格复刻 badvpn-udpgw 的协议逻辑
 func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
-	log.Printf("UdpGw Proxy: New session for %s", clientKey)
-	defer log.Printf("UdpGw Proxy: Session for %s closed", clientKey)
-	defer ch.Close()
-	defer delTargetAddr(clientKey)
-
+	log.Printf("UdpGw Handler: New session for %s", clientKey)
+	
 	udpConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
-		log.Printf("UdpGw Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
+		log.Printf("UdpGw Handler: Failed to listen on UDP for %s: %v", clientKey, err)
+		ch.Close()
 		return
 	}
-	defer udpConn.Close()
 
-	done := make(chan struct{})
+	state := &clientState{
+		udpConn: udpConn,
+		sshChan: ch,
+		done:    make(chan struct{}),
+		key:     clientKey,
+	}
+	clientManager.Add(clientKey, state)
 
-	// Goroutine 1: 从SSH读取、解析、发送
+	defer func() {
+		log.Printf("UdpGw Handler: Session for %s closed", clientKey)
+		clientManager.Delete(clientKey)
+		ch.Close()
+	}()
+
+	// Goroutine 1: 从SSH读取、解析、发送 (这是核心逻辑)
 	go func() {
-		defer close(done)
+		defer close(state.done) // 此goroutine结束，通知另一个goroutine
 		for {
 			lenBytes := make([]byte, 2)
 			if _, err := io.ReadFull(ch, lenBytes); err != nil {
 				return
 			}
 			dataLen := binary.BigEndian.Uint16(lenBytes)
-			if dataLen == 0 { continue }
-			if dataLen > 4096 {
-				log.Printf("UdpGw Proxy: Invalid data length %d from %s", dataLen, clientKey)
+			if dataLen == 0 || dataLen > 4096 {
 				return
 			}
+			
 			fullData := make([]byte, dataLen)
 			if _, err := io.ReadFull(ch, fullData); err != nil {
 				return
@@ -77,24 +99,26 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 			packetType := fullData[0]
 			payload := fullData[1:]
 
-			if packetType == 0 {
-				destAddr := getTargetAddr(clientKey)
-				if destAddr == nil {
-					continue
-				}
-				udpConn.WriteTo(payload, destAddr)
-			} else {
+			if packetType != 0 { // 控制帧: 设置/更新目标地址
 				addrStr := string(payload)
 				if !strings.Contains(addrStr, ":") {
 					addrStr = fmt.Sprintf("%s:7300", addrStr)
 				}
 				destAddr, err := net.ResolveUDPAddr("udp", addrStr)
 				if err != nil {
-					log.Printf("UdpGw Proxy: Failed to resolve destination '%s' for %s: %v", addrStr, clientKey, err)
+					log.Printf("UdpGw Handler: Failed to resolve destination '%s' for %s: %v", addrStr, clientKey, err)
 					return
 				}
-				setTargetAddr(clientKey, destAddr)
-				log.Printf("UdpGw Proxy: Set new UDP destination to %s for %s", destAddr, clientKey)
+				state.targetAddr = destAddr // 更新会话状态
+				log.Printf("UdpGw Handler: Set UDP destination to %s for %s", destAddr, clientKey)
+
+			} else { // 数据帧: 发送UDP数据
+				if state.targetAddr == nil {
+					continue // 如果目标地址还没设置，就忽略数据包
+				}
+				if _, err := udpConn.WriteTo(payload, state.targetAddr); err != nil {
+					// 忽略发送错误
+				}
 			}
 		}
 	}()
@@ -104,7 +128,7 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 		buf := make([]byte, 4096)
 		for {
 			select {
-			case <-done:
+			case <-state.done:
 				return
 			default:
 			}
@@ -115,8 +139,7 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				ch.Close()
-				return
+				return 
 			}
 			
 			udpRemote := remote.(*net.UDPAddr)
@@ -138,5 +161,6 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 		}
 	}()
 
-	<-done
+	// 等待会话结束
+	<-state.done
 }
