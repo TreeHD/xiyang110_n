@@ -1,16 +1,15 @@
 #!/bin/bash
 
 # =================================================================
-# WSTunnel-Go (TCP + SOCKS5 UDP Proxy Mode) 全自动一键安装/更新脚本
+# WSTunnel-Go (Pure TCP Proxy Mode) 全自动一键安装/更新脚本
 # 作者: xiaoguidays & Gemini
 # 更新时间: 2025-10-21
-# 版本: 5.0 (SOCKS5 UDP Final)
+# 版本: 6.0 (Pure TCP Final)
 # 更新内容:
-#   - 适配全新的SOCKS5 UDP代理架构 (main.go, socks5_udp_handler.go)。
-#   - [移除] 不再需要TUN/NAT相关的Go文件 (ip_tunnel, session_manager, nat_setup)。
-#   - [移除] 不再需要系统依赖 iproute2, iptables。
-#   - [简化权限] systemd服务不再需要CAP_NET_ADMIN等高权限。
-#   - 更新所有描述文本以匹配新功能。
+#   - 适配最终的纯TCP代理架构 (仅 main.go)。
+#   - [移除] 不再需要任何UDP处理相关的Go文件。
+#   - [移除] 不再需要任何特殊系统依赖。
+#   - [最终简化] 权限配置为纯TCP代理的最小需求。
 # =================================================================
 
 set -e # 任何命令失败，脚本立即退出
@@ -89,8 +88,8 @@ rm -rf "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "进入项目目录 '$PROJECT_DIR' 失败！"
 
-# 定义文件列表 (2个Go文件 + 3个网页/配置文件)
-FILES=("main.go" "socks5_udp_handler.go" "admin.html" "login.html" "config.json")
+# 定义文件列表 (1个Go文件 + 3个网页/配置文件)
+FILES=("main.go" "admin.html" "login.html" "config.json")
 
 for file in "${FILES[@]}"; do
     info "  -> 正在下载 ${file}..."
@@ -136,12 +135,12 @@ fi
 info "文件部署成功。"
 echo " "
 
-# 7. 创建并启用 systemd 服务 (简化版权限)
+# 7. 创建并启用 systemd 服务 (最简化权限)
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 info "第 7 步: 正在配置 systemd 服务..."
 cat > "$SERVICE_FILE" <<EOT
 [Unit]
-Description=WSTunnel-Go Service (TCP + SOCKS5 UDP Proxy Mode)
+Description=WSTunnel-Go Service (Pure TCP Proxy Mode)
 After=network.target
 
 [Service]
@@ -154,10 +153,8 @@ Restart=always
 RestartSec=3
 LimitNOFILE=65536
 
-# --- [权限简化] ---
-# TCP/UDP代理模式不再需要网络管理权限 (CAP_NET_ADMIN)
-# User=root 已足以绑定低位端口 (如 80)
-# 如需更高安全性，可改为非root用户并添加 CAP_NET_BIND_SERVICE
+# --- [最终简化权限] ---
+# 纯TCP代理模式只需要绑定低位端口的权限
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
@@ -177,7 +174,7 @@ info "操作成功。"
 echo " "
 
 # 最终确认
-info "🎉 全部成功！WSTunnel-Go 已安装/更新并正在运行。"
+info "🎉 全部成功！WSTunnel-Go 已安装/更新并正在运行 (纯TCP代理模式)。"
 echo " "
 info "您可以通过以下命令检查服务状态:"
 info "  systemctl status ${SERVICE_NAME}.service"
