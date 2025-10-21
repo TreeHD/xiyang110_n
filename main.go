@@ -24,16 +24,29 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 (无变化) ---
-type AccountInfo struct { Password, ExpiryDate string; Enabled bool }
-type Config struct {
-	ListenAddr, UdpSocksAddr, AdminAddr, ConnectUA string
-	SocksAddrs []string
-	AdminAccounts map[string]string
-	Accounts map[string]AccountInfo
-	HandshakeTimeout, BufferSizeKB, IdleTimeoutSeconds, HealthCheckInterval, ConnectionPoolSize int
-	lock sync.RWMutex
+// --- 结构体及全局变量 ---
+type AccountInfo struct {
+	Password   string `json:"password"`
+	Enabled    bool   `json:"enabled"`
+	ExpiryDate string `json:"expiry_date"`
 }
+
+type Config struct {
+	ListenAddr          string                 `json:"listen_addr"`
+	SocksAddrs          []string               `json:"socks_addrs"`
+	UdpSocksAddr        string                 `json:"udp_socks_addr,omitempty"`
+	AdminAddr           string                 `json:"admin_addr"`
+	AdminAccounts       map[string]string      `json:"admin_accounts"`
+	Accounts            map[string]AccountInfo `json:"accounts"`
+	HandshakeTimeout    int                    `json:"handshake_timeout,omitempty"`
+	ConnectUA           string                 `json:"connect_ua,omitempty"`
+	BufferSizeKB        int                    `json:"buffer_size_kb,omitempty"`
+	IdleTimeoutSeconds  int                    `json:"idle_timeout_seconds,omitempty"`
+	HealthCheckInterval int                    `json:"health_check_interval,omitempty"`
+	ConnectionPoolSize  int                    `json:"connection_pool_size,omitempty"`
+	lock                sync.RWMutex
+}
+
 var globalConfig *Config
 var activeConn int64
 type OnlineUser struct { ConnID, Username, RemoteAddr string; ConnectTime time.Time; sshConn ssh.Conn }
@@ -53,8 +66,8 @@ var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024);
 // ==============================================================================
 
 const (
-	protocolTCP = 0x01
-	protocolUDP = 0x02
+	protocolTCP byte = 0x01
+	protocolUDP byte = 0x02
 )
 
 // readSmartPacket 解析一个 [2B len][1B proto][1B atyp]... 格式的包
@@ -105,8 +118,6 @@ func readSmartPacket(r io.Reader) (proto byte, destAddr string, payload []byte, 
 
 // writeSmartPacket 将数据包封装回传给客户端
 func writeSmartPacket(w io.Writer, proto byte, payload []byte) error {
-	// 假设回传时不需要地址，只需要[总长度][协议][数据]
-	// 总长度 = 1字节协议 + 数据长度
 	totalLength := uint16(1 + len(payload))
 	if err := binary.Write(w, binary.BigEndian, totalLength); err != nil { return err }
 	if _, err := w.Write([]byte{proto}); err != nil { return err }
@@ -114,104 +125,142 @@ func writeSmartPacket(w io.Writer, proto byte, payload []byte) error {
 	return nil
 }
 
+// buildSocks5UDPRequest 将裸UDP包和目标地址，封装成SOCKS5 UDP请求格式
+func buildSocks5UDPRequest(destAddr string, payload []byte) ([]byte, error) {
+	host, portStr, err := net.SplitHostPort(destAddr)
+	if err != nil { return nil, fmt.Errorf("invalid dest addr '%s': %w", destAddr, err) }
+	port, err := strconv.Atoi(portStr)
+	if err != nil { return nil, fmt.Errorf("invalid port '%s': %w", portStr, err) }
+	addrBytes := []byte(host)
+	atyp := byte(0x03)
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil { atyp = 0x01; addrBytes = ip.To4() } else { atyp = 0x04; addrBytes = ip.To16() }
+	}
+	header := []byte{0x00, 0x00, 0x00}
+	header = append(header, atyp)
+	if atyp == 0x03 { header = append(header, byte(len(addrBytes))) }
+	header = append(header, addrBytes...)
+	header = binary.BigEndian.AppendUint16(header, uint16(port))
+	return append(header, payload...), nil
+}
+
+// socks5UdpAssociate 与SOCKS5服务器执行UDP ASSOCIATE命令，并返回一个可用的UDP连接
+func socks5UdpAssociate(socksAddr string) (net.PacketConn, net.Conn, *net.UDPAddr, error) {
+	tcpConn, err := net.DialTimeout("tcp", socksAddr, 5*time.Second)
+	if err != nil { return nil, nil, nil, fmt.Errorf("failed to dial socks5 server: %w", err) }
+	if _, err := tcpConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to write auth request: %w", err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(tcpConn, resp); err != nil {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to read auth response: %w", err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("socks5 auth failed, received: %v", resp)
+	}
+	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	if _, err := tcpConn.Write(req); err != nil {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to write udp associate request: %w", err)
+	}
+	resp = make([]byte, 10)
+	if _, err := io.ReadFull(tcpConn, resp); err != nil {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to read udp associate response: %w", err)
+	}
+	if resp[1] != 0x00 {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("udp associate failed, status: %d", resp[1])
+	}
+	relayIP := net.IP(resp[4:8]).String()
+	relayPort := binary.BigEndian.Uint16(resp[8:10])
+	relayAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", relayIP, relayPort))
+	if err != nil {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to resolve relay udp addr: %w", err)
+	}
+	udpConn, err := net.ListenPacket("udp", "")
+	if err != nil {
+		tcpConn.Close(); return nil, nil, nil, fmt.Errorf("failed to listen on local udp port: %w", err)
+	}
+	return udpConn, tcpConn, relayAddr, nil
+}
+
+
 // ==============================================================================
 // === 核心重构: 统一的智能流量处理器 ===
 // ==============================================================================
 
 func handleSmartRelay(ch ssh.Channel, sshConn ssh.Conn) {
 	defer ch.Close()
-
-	// 1. 先读取第一个包，以确定是TCP还是UDP会话
 	proto, destAddr, initialPayload, err := readSmartPacket(ch)
 	if err != nil {
 		if err != io.EOF { log.Printf("Failed to read initial smart packet for %s: %v", sshConn.RemoteAddr(), err) }
 		return
 	}
 
-	// 2. 根据协议类型，进入不同的处理逻辑
 	switch proto {
 	case protocolTCP:
 		log.Printf("SmartRelay: Detected TCP stream to %s for %s", destAddr, sshConn.RemoteAddr())
-		// --- TCP 处理逻辑 ---
-		// 使用 SOCKS5 连接池
 		var bestProxy *pooledProxy
 		minConns := int64(math.MaxInt64)
 		poolLock.RLock()
-		for _, p := range proxyPool {
-			if p.isHealthy() {
-				conns := p.getActiveConns()
-				if conns < minConns {
-					minConns = conns
-					bestProxy = p
-				}
-			}
-		}
+		healthyProxies := []*pooledProxy{}
+		for _, p := range proxyPool { if p.isHealthy() { healthyProxies = append(healthyProxies, p) } }
 		poolLock.RUnlock()
-
-		if bestProxy == nil {
-			log.Printf("SmartRelay: No healthy SOCKS5 proxies for TCP for %s", sshConn.RemoteAddr())
-			return
+		if len(healthyProxies) == 0 { log.Printf("SmartRelay: No healthy SOCKS5 proxies for TCP for %s", sshConn.RemoteAddr()); return }
+		for _, p := range healthyProxies {
+			conns := p.getActiveConns()
+			if conns < minConns { minConns = conns; bestProxy = p }
 		}
+		if bestProxy == nil { log.Printf("SmartRelay: Could not select a best proxy for TCP for %s", sshConn.RemoteAddr()); return }
 
 		host, portStr, _ := net.SplitHostPort(destAddr)
 		port, _ := strconv.Atoi(portStr)
-		
 		bestProxy.incrConnections()
 		defer bestProxy.decrConnections()
-
 		remoteConn, err := socks5Connect(bestProxy.addr, host, uint16(port), false)
-		if err != nil {
-			log.Printf("SmartRelay: SOCKS5 CONNECT to %s failed for %s: %v", destAddr, sshConn.RemoteAddr(), err)
-			return
-		}
+		if err != nil { log.Printf("SmartRelay: SOCKS5 CONNECT to %s failed for %s: %v", destAddr, sshConn.RemoteAddr(), err); return }
 		defer remoteConn.Close()
 
-		// 将第一个包的数据写入远程连接
 		if _, err := remoteConn.Write(initialPayload); err != nil {
 			log.Printf("SmartRelay: Failed to write initial TCP payload for %s: %v", sshConn.RemoteAddr(), err)
 			return
 		}
-
-		// 开始双向拷贝剩余的数据
 		done := make(chan struct{})
 		go func() {
-			io.Copy(remoteConn, ch)
-			if tcpConn, ok := remoteConn.(*net.TCPConn); ok { tcpConn.CloseWrite() }
-			close(done)
+			defer func() { if tcpConn, ok := remoteConn.(*net.TCPConn); ok { tcpConn.CloseWrite() }; close(done) }()
+			// In this direction, we don't need smart packets, just raw data
+			io.Copy(remoteConn, ch) 
 		}()
-		io.Copy(ch, remoteConn)
+		// In this direction, we need to wrap responses into smart packets
+		for {
+			buf := make([]byte, 32*1024)
+			nr, er := remoteConn.Read(buf)
+			if nr > 0 {
+				if err := writeSmartPacket(ch, protocolTCP, buf[:nr]); err != nil {
+					log.Printf("Error writing smart TCP packet to client %s: %v", sshConn.RemoteAddr(), err)
+					break
+				}
+			}
+			if er != nil { break }
+		}
 		<-done
 
 	case protocolUDP:
 		log.Printf("SmartRelay: Detected UDP stream to %s for %s", destAddr, sshConn.RemoteAddr())
-		// --- UDP 处理逻辑 ---
 		udpSocksAddr := globalConfig.UdpSocksAddr
 		if udpSocksAddr == "" {
 			log.Printf("ERROR: udp_socks_addr is not configured. Cannot handle UDP traffic for %s.", sshConn.RemoteAddr())
 			return
 		}
-		
 		udpRelay, tcpControlConn, relayAddr, err := socks5UdpAssociate(udpSocksAddr)
-		if err != nil {
-			log.Printf("SmartRelay: SOCKS5 UDP Associate failed for %s: %v", sshConn.RemoteAddr(), err)
-			return
-		}
+		if err != nil { log.Printf("SmartRelay: SOCKS5 UDP Associate failed for %s: %v", sshConn.RemoteAddr(), err); return }
 		defer udpRelay.Close()
 		defer tcpControlConn.Close()
 
-		// 先处理第一个包
 		socksRequest, err := buildSocks5UDPRequest(destAddr, initialPayload)
-		if err != nil {
-			log.Printf("SmartRelay: Error building initial SOCKS5 UDP request for %s: %v", destAddr, err)
-			return
-		}
-		if _, err := udpRelay.WriteTo(socksRequest, relayAddr); err != nil {
-			log.Printf("SmartRelay: Error writing initial UDP packet for %s: %v", sshConn.RemoteAddr(), err)
-			return
-		}
+		if err != nil { log.Printf("SmartRelay: Error building initial SOCKS5 UDP request for %s: %v", destAddr, err); return }
+		if _, err := udpRelay.WriteTo(socksRequest, relayAddr); err != nil { log.Printf("SmartRelay: Error writing initial UDP packet for %s: %v", sshConn.RemoteAddr(), err); return }
 		
 		done := make(chan struct{})
-		go func() { // 从SSH读取 -> 解外套 -> 封装SOCKS头 -> 发送
+		go func() {
 			defer func() { udpRelay.Close(); close(done) }()
 			for {
 				_, destAddr, payload, err := readSmartPacket(ch)
@@ -220,30 +269,25 @@ func handleSmartRelay(ch ssh.Channel, sshConn ssh.Conn) {
 					return
 				}
 				socksRequest, err := buildSocks5UDPRequest(destAddr, payload)
-				if err != nil {
-					log.Printf("Error building subsequent SOCKS5 UDP request for %s: %v", destAddr, err)
-					continue
-				}
+				if err != nil { log.Printf("Error building subsequent SOCKS5 UDP request for %s: %v", destAddr, err); continue }
 				if _, err := udpRelay.WriteTo(socksRequest, relayAddr); err != nil {
 					log.Printf("Error writing subsequent UDP packet for %s: %v", sshConn.RemoteAddr(), err)
 					return
 				}
 			}
 		}()
-
-		for { // 从SOCKS UDP读取 -> 穿自定义外套 -> 写回SSH
+		for {
 			buf := make([]byte, 65535)
 			n, _, err := udpRelay.ReadFrom(buf)
 			if err != nil {
 				select {
 				case <-done:
-				default:
-					log.Printf("Error reading from UDP relay for client %s: %v", sshConn.RemoteAddr(), err)
+				default: log.Printf("Error reading from UDP relay for client %s: %v", sshConn.RemoteAddr(), err)
 				}
 				return
 			}
 			if err := writeSmartPacket(ch, protocolUDP, buf[:n]); err != nil {
-				log.Printf("Error writing smart packet to client %s: %v", sshConn.RemoteAddr(), err)
+				log.Printf("Error writing smart UDP packet to client %s: %v", sshConn.RemoteAddr(), err)
 				return
 			}
 		}
@@ -275,12 +319,10 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
 		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
 		
-		// 只要是发往 7300 的，都交给智能处理器
 		if payload.Host == "127.0.0.1" && payload.Port == 7300 {
 			log.Printf("Hijacking smart stream for user '%s' from %s", sshConn.User(), sshConn.RemoteAddr())
 			go handleSmartRelay(ch, sshConn)
 		} else {
-			// 对于不经过客户端封装软件的、标准的SSH端口转发，我们仍然保留旧的TCP处理逻辑
 			log.Printf("Handling standard direct-tcpip to %s:%d for user '%s'", payload.Host, payload.Port, sshConn.User())
 			go handleDirectTCPIP(ch, payload.Host, payload.Port)
 		}
@@ -288,12 +330,9 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 }
 
 // ==============================================================================
-// === 其余所有辅助函数都保持不变 ===
+// === 其余代码保持不变 ===
 // ==============================================================================
 
-// ... (此处省略所有其他未修改的函数: main, handleDirectTCPIP, NewPooledProxy, checkHealth, socks5UdpAssociate, buildSocks5UDPRequest, 等等)
-// ... (为了简洁，我只粘贴有修改的核心部分，其余函数请使用上一份完整代码中的版本)
-// ... (在实际使用时，请确保这是一个完整的go文件)
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
 	var bestProxy *pooledProxy; minConns := int64(math.MaxInt64)
