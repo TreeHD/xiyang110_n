@@ -90,7 +90,7 @@ mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "进入项目目录 '$PROJECT_DIR' 失败！"
 
 # 定义文件列表 (2个Go文件 + 3个网页/配置文件)
-FILES=("main.go" "simple_udp_handler.go" "admin.html" "login.html" "config.json")
+FILES=("main.go" "socks5_udp_handler.go" "admin.html" "login.html" "config.json")
 
 for file in "${FILES[@]}"; do
     info "  -> 正在下载 ${file}..."
