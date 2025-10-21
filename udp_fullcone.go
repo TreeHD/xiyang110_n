@@ -21,7 +21,7 @@ type fullConeSession struct {
 	clientChannel ssh.Channel  // 回写给客户端的SSH信道
 	publicConn    net.PacketConn // 服务器对外暴露的UDP "专属外线"
 	lastActive    time.Time
-	remoteAddr    net.Addr     // *** 新增：存储客户端的真实地址用于日志 ***
+	remoteAddr    net.Addr     // 存储客户端的真实地址用于日志
 }
 
 // sessionManager 管理所有UDP会话
@@ -78,7 +78,7 @@ func handleUDPProxy(ch ssh.Channel, remoteAddr net.Addr) {
 		clientChannel: ch,
 		publicConn:    publicConn,
 		lastActive:    time.Now(),
-		remoteAddr:    remoteAddr, // *** 新增：保存地址 ***
+		remoteAddr:    remoteAddr,
 	}
 
 	sessionManager.Lock()
@@ -91,7 +91,7 @@ func handleUDPProxy(ch ssh.Channel, remoteAddr net.Addr) {
 
 // tcpToUDP 从客户端的SSH信道读取SOCKS5 UDP帧，并发送到外网
 func tcpToUDP(s *fullConeSession) {
-	clientKey := s.remoteAddr.String() // *** 修正：从session中获取地址 ***
+	clientKey := s.remoteAddr.String()
 	for {
 		header := make([]byte, 4)
 		if _, err := io.ReadFull(s.clientChannel, header); err != nil {
@@ -146,9 +146,13 @@ func tcpToUDP(s *fullConeSession) {
 	}
 }
 
+
+// ==============================================================================
+// === 最终修正: 在 udpToTCP 中使用 clientKey 变量 ===
+// ==============================================================================
 // udpToTCP 从服务器的“专属外线”接收UDP包，打包成SOCKS5 UDP帧并发回客户端
 func udpToTCP(s *fullConeSession) {
-	clientKey := s.remoteAddr.String() // *** 修正：从session中获取地址 ***
+	clientKey := s.remoteAddr.String() // **现在这个变量将被使用**
 	buf := make([]byte, 2048)
 	for {
 		n, remoteAddr, err := s.publicConn.ReadFrom(buf)
@@ -182,6 +186,8 @@ func udpToTCP(s *fullConeSession) {
 		frame = append(frame, buf[:n]...)
 		
 		if _, err := s.clientChannel.Write(frame); err != nil {
+			// *** 在日志中使用 clientKey ***
+			log.Printf("FullCone NAT: Error writing UDP frame back to client %s: %v", clientKey, err)
 			return
 		}
 
