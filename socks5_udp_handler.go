@@ -36,16 +36,16 @@ func delConn(clientKey string) {
 	}
 }
 
-// handleSocks5UDP 的最终实现，匹配客户端的真实协议
+// handleSocks5UDP 的最终实现，匹配最简化的协议
 func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
-	log.Printf("Custom UDP Proxy: New session for %s", clientKey)
-	defer log.Printf("Custom UDP Proxy: Session for %s closed", clientKey)
+	log.Printf("Final UDP Proxy: New session for %s", clientKey)
+	defer log.Printf("Final UDP Proxy: Session for %s closed", clientKey)
 	defer ch.Close()
 
 	udpConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
-		log.Printf("Custom UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
+		log.Printf("Final UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
 		return
 	}
 	defer udpConn.Close()
@@ -58,45 +58,35 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 	go func() {
 		defer close(done)
 		for {
-			// 最终确定的协议格式: [2字节总长度][4字节目标IPv4地址][2字节目标端口][UDP真实数据]
+			// 最终协议格式: [4字节目标IPv4地址][2字节目标端口][UDP真实数据]
 
-			// 1. 读取2字节的总长度
-			lenBytes := make([]byte, 2)
-			if _, err := io.ReadFull(ch, lenBytes); err != nil {
-				return
-			}
-			totalLen := int(binary.BigEndian.Uint16(lenBytes))
-
-			// 2. 读取剩余的全部数据
-			if totalLen < 6 { // 长度至少要包含 IP(4) + Port(2)
-				log.Printf("Custom UDP Proxy: Invalid packet length %d from %s. Closing session.", totalLen, clientKey)
+			// 1. 读取6字节的目标地址头
+			header := make([]byte, 6)
+			if _, err := io.ReadFull(ch, header); err != nil {
 				return
 			}
 			
-			data := make([]byte, totalLen)
-			if _, err := io.ReadFull(ch, data); err != nil {
-				return
-			}
-
-			// 3. 从数据中解析出地址、端口和负载
-			destIP := net.IP(data[0:4])
-			destPort := binary.BigEndian.Uint16(data[4:6])
-			payload := data[6:]
-
-			// 检查负载是否为空，如果为空则忽略
-			if len(payload) == 0 {
-				continue
-			}
+			// 2. 解析IP和端口
+			destIP := net.IP(header[0:4])
+			destPort := binary.BigEndian.Uint16(header[4:6])
 
 			destAddrStr := fmt.Sprintf("%s:%d", destIP.String(), destPort)
 			destAddr, err := net.ResolveUDPAddr("udp", destAddrStr)
 			if err != nil {
 				continue
 			}
-			
+
+			// 3. 读取剩余的数据作为UDP负载
+			// 假设一个Read调用能读完一个UDP包的数据，这是合理的。
+			payload := make([]byte, 2048) // 分配足够大的缓冲区
+			n, err := ch.Read(payload)
+			if err != nil {
+				return // 任何错误都关闭会话
+			}
+
 			// 4. 发送UDP包
-			if _, err := udpConn.WriteTo(payload, destAddr); err != nil {
-				// 忽略单个包的发送错误，继续处理下一个
+			if _, err := udpConn.WriteTo(payload[:n], destAddr); err != nil {
+				// 忽略发送错误
 			}
 		}
 	}()
@@ -117,7 +107,6 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				// 真正的错误发生，通过关闭SSH通道来通知另一个goroutine退出
 				ch.Close()
 				return
 			}
@@ -128,16 +117,14 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 				continue // 只处理IPv4回包
 			}
 
-			// 封装回包: [2字节总长][4字节源IP][2字节源端口][数据]
+			// 封装回包: [4字节源IP][2字节源端口][数据]
 			payload := buf[:n]
-			totalLen := 4 + 2 + len(payload)
 			
-			frame := make([]byte, 2+totalLen)
+			frame := make([]byte, 6+len(payload))
 			
-			binary.BigEndian.PutUint16(frame[0:2], uint16(totalLen))
-			copy(frame[2:6], remoteIP)
-			binary.BigEndian.PutUint16(frame[6:8], uint16(udpRemote.Port))
-			copy(frame[8:], payload)
+			copy(frame[0:4], remoteIP)
+			binary.BigEndian.PutUint16(frame[4:6], uint16(udpRemote.Port))
+			copy(frame[6:], payload)
 
 			if _, err := ch.Write(frame); err != nil {
 				return
