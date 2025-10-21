@@ -73,7 +73,7 @@ rm -rf "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "无法进入项目目录 '$PROJECT_DIR'！"
 
-FILES=("main.go" "udpgw_handler.go" "admin.html" "login.html" "config.json")
+FILES=("main.go" "admin.html" "login.html" "config.json")
 for file in "${FILES[@]}"; do
     echo "  -> 正在下载 ${file}..."
     wget -q -O "${file}" "https://raw.githubusercontent.com/${GITHUB_REPO}/${BRANCH}/${file}" || error_exit "下载 ${file} 失败！"
