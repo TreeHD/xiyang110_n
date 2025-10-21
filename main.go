@@ -155,9 +155,10 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
+	// [最终修正] 确保调用的是 handleSocks5UDP
 	if destPort == 7300 {
 		log.Printf("Detected UDP request on port 7300 from %s", remoteAddr)
-		handleSocks5UDP(ch, remoteAddr) // 保持函数名不变
+		handleSocks5UDP(ch, remoteAddr) 
 		return
 	}
 
