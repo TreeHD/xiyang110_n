@@ -24,30 +24,22 @@ type clientState struct {
 	key        string
 }
 
-// [核心修正] 定义一个具名的 ClientManager 类型
+// ClientManager 定义
 type ClientManager struct {
 	sync.RWMutex
 	clients map[string]*clientState
 }
 
-// [核心修正] 创建一个具名类型的全局实例
 var clientManager = &ClientManager{
 	clients: make(map[string]*clientState),
 }
 
-// [核心修正] 方法现在附加到 *ClientManager 类型上
+// Add, Get, Delete 方法保持不变
 func (cm *ClientManager) Add(key string, state *clientState) {
 	cm.Lock()
 	defer cm.Unlock()
 	cm.clients[key] = state
 }
-
-func (cm *ClientManager) Get(key string) *clientState {
-	cm.RLock()
-	defer cm.RUnlock()
-	return cm.clients[key]
-}
-
 func (cm *ClientManager) Delete(key string) {
 	cm.Lock()
 	defer cm.Unlock()
@@ -57,19 +49,18 @@ func (cm *ClientManager) Delete(key string) {
 	}
 }
 
-// handleUdpGw 的最终实现，增加了调试日志和容错
+// handleUdpGw 的最终实现
 func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
 	log.Printf("Hybrid UDP Proxy: New session for %s", clientKey)
-	defer log.Printf("Hybrid UDP Proxy: Session for %s closed", clientKey)
-	defer ch.Close()
-
+	
 	udpConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		log.Printf("Hybrid UDP Proxy: Failed to listen on UDP for %s: %v", clientKey, err)
+		ch.Close()
 		return
 	}
-	
+
 	defaultDNSAddr, _ := net.ResolveUDPAddr("udp", "8.8.8.8:53")
 
 	state := &clientState{
@@ -79,8 +70,13 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 		done:    make(chan struct{}),
 		key:     clientKey,
 	}
-	clientManager.Add(clientKey, state) // 现在可以正确调用
-	defer clientManager.Delete(clientKey) // 现在可以正确调用
+	clientManager.Add(clientKey, state)
+
+	defer func() {
+		log.Printf("Hybrid UDP Proxy: Session for %s closed", clientKey)
+		clientManager.Delete(clientKey)
+	//	ch.Close() // ch 由上层调用者关闭
+	}()
 
 	// Goroutine 1: 从SSH读取、智能解析、发送
 	go func() {
@@ -103,9 +99,7 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 
 				if packetType != 0 { // 控制帧
 					addrStr := string(payload)
-					if !strings.Contains(addrStr, ":") {
-						addrStr = fmt.Sprintf("%s:7300", addrStr)
-					}
+					if !strings.Contains(addrStr, ":") { addrStr = fmt.Sprintf("%s:7300", addrStr) }
 					destAddr, err := net.ResolveUDPAddr("udp", addrStr)
 					if err != nil {
 						log.Printf("Hybrid UDP Proxy: Failed to resolve UdpGw destination '%s': %v", addrStr, err)
@@ -124,7 +118,6 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 				if err != nil { return }
 				
 				dnsPacket := append(header, restOfPacket[:n]...)
-				log.Printf("Hybrid UDP Proxy: Detected raw DNS query (len %d)", len(dnsPacket))
 				udpConn.WriteTo(dnsPacket, state.dnsAddr)
 			}
 		}
@@ -144,7 +137,7 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 			n, remote, err := udpConn.ReadFrom(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() { continue }
-				return
+				return 
 			}
 			
 			udpRemote := remote.(*net.UDPAddr)
@@ -152,14 +145,16 @@ func handleUdpGw(ch ssh.Channel, remoteAddr net.Addr) {
 			if remoteIP == nil { continue }
 			
 			payload := buf[:n]
+			
+			// [核心修复] 对所有回包都使用同一种最简单的格式
+			// 客户端既然能发两种格式，大概率也能接收一种统一的格式
+			// 格式: [4字节源IP][2字节源端口][数据]
+			frame := make([]byte, 6+len(payload))
+			
+			copy(frame[0:4], remoteIP)
+			binary.BigEndian.PutUint16(frame[4:6], uint16(udpRemote.Port))
+			copy(frame[6:], payload)
 
-			// 简化回包逻辑：假设客户端都能处理UdpGw格式的回包
-			totalLen := 4 + 2 + len(payload)
-			frame := make([]byte, 2+totalLen)
-			binary.BigEndian.PutUint16(frame[0:2], uint16(totalLen))
-			copy(frame[2:6], remoteIP)
-			binary.BigEndian.PutUint16(frame[6:8], uint16(udpRemote.Port))
-			copy(frame[8:], payload)
 			if _, err := ch.Write(frame); err != nil {
 				return
 			}
