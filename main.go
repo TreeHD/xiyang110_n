@@ -61,7 +61,7 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// --- 辅助函数 (已恢复完整实现) ---
+// --- 辅助函数 ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 
@@ -101,7 +101,6 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.WriteHeader(code)
 	w.Write(response)
 }
-
 
 // --- 核心数据转发逻辑 ---
 var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024); return &b }}
@@ -157,8 +156,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	defer atomic.AddInt64(&activeConn, -1)
 
 	if destPort == 7300 {
-		log.Printf("Detected UDP proxy request on port 7300 from %s", remoteAddr.String())
-		handleUDPProxy(ch, remoteAddr)
+		handleIPTunnel(ch, remoteAddr)
 		return
 	}
 
@@ -203,6 +201,7 @@ type combinedConn struct {
 	net.Conn
 	reader io.Reader
 }
+
 func (c *combinedConn) Read(p []byte) (n int, err error) { return c.reader.Read(p) }
 
 func httpHandshake(conn net.Conn) (net.Conn, error) {
@@ -457,19 +456,23 @@ func main() {
 	if globalConfig.ListenAddr == "" || len(globalConfig.AdminAccounts) == 0 {
 		log.Fatalf("FATAL: config.json 缺少 listen_addr 或 admin_accounts")
 	}
-	
+
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 5 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
 	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 128 }
 	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 90 }
-	
+
 	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
-	
-	log.Println("====== WSTUNNEL (TCP + UDP FullCone NAT Mode) Starting ======")
+
+	if err := createTunDevice(); err != nil {
+		log.Fatalf("FATAL: Could not create TUN device: %v. Please ensure you are running as root and have TUN module loaded.", err)
+	}
+
+	log.Println("====== WSTUNNEL (TCP + IP Tunnel Mode) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
 		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
-	
+
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
@@ -487,14 +490,18 @@ func main() {
 			log.Fatalf("FATAL: 无法启动Admin panel: %v", err)
 		}
 	}()
-	
+
 	sshCfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 			globalConfig.lock.RLock()
 			accountInfo, userExists := globalConfig.Accounts[c.User()]
 			globalConfig.lock.RUnlock()
-			if !userExists { return nil, fmt.Errorf("user not found") }
-			if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }
+			if !userExists {
+				return nil, fmt.Errorf("user not found")
+			}
+			if !accountInfo.Enabled {
+				return nil, fmt.Errorf("user disabled")
+			}
 			if accountInfo.ExpiryDate != "" {
 				expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate)
 				if err != nil || time.Now().After(expiry.Add(24*time.Hour)) {
@@ -509,12 +516,21 @@ func main() {
 			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
-	_, priv, err := ed25519.GenerateKey(rand.Reader); if err != nil { log.Fatalf("generate host key fail: %v", err) }
-	privateKey, err := ssh.NewSignerFromKey(priv); if err != nil { log.Fatalf("create signer fail: %v", err) }
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatalf("generate host key fail: %v", err)
+	}
+	privateKey, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		log.Fatalf("create signer fail: %v", err)
+	}
 	sshCfg.AddHostKey(privateKey)
 
-	l, err := net.Listen("tcp", globalConfig.ListenAddr); if err != nil { log.Fatalf("listen fail: %v", err) }
-	log.Printf("SSH server listening on %s. UDP traffic will be handled via FullCone NAT on port 7300.", globalConfig.ListenAddr)
+	l, err := net.Listen("tcp", globalConfig.ListenAddr)
+	if err != nil {
+		log.Fatalf("listen fail: %v", err)
+	}
+	log.Printf("SSH server listening on %s. IP Tunnel traffic will be handled on port 7300.", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
