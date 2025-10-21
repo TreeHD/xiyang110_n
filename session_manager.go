@@ -13,25 +13,28 @@ type clientSession struct {
 	packetChan chan<- []byte
 }
 
-// SessionManager 负责管理所有客户端的会话
-var sessionManager = struct {
+// SessionManager 负责管理所有客户端的会话 (这是修正后的具名类型)
+type SessionManager struct {
 	sync.RWMutex
 	// key: 客户端在TUN网络中的IP地址 (例如 "10.0.0.2")
 	sessions map[string]*clientSession
-}{
+}
+
+// 创建一个全局的 SessionManager 实例
+var sessionManager = &SessionManager{
 	sessions: make(map[string]*clientSession),
 }
 
-// Register 注册一个新的客户端会话
-func (sm *sessionManager) Register(clientIP string, session *clientSession) {
+// Register 注册一个新的客户端会话 (现在是 SessionManager 类型的方法)
+func (sm *SessionManager) Register(clientIP string, session *clientSession) {
 	sm.Lock()
 	defer sm.Unlock()
 	log.Printf("Session Manager: Registering session for IP %s", clientIP)
 	sm.sessions[clientIP] = session
 }
 
-// Unregister 注销一个客户端会话
-func (sm *sessionManager) Unregister(clientIP string) {
+// Unregister 注销一个客户端会话 (现在是 SessionManager 类型的方法)
+func (sm *SessionManager) Unregister(clientIP string) {
 	sm.Lock()
 	defer sm.Unlock()
 	// 只有当IP不为空时才注销，防止空IP导致错误
@@ -41,8 +44,8 @@ func (sm *sessionManager) Unregister(clientIP string) {
 	}
 }
 
-// GetSession 根据IP地址查找对应的客户端会话
-func (sm *sessionManager) GetSession(clientIP string) *clientSession {
+// GetSession 根据IP地址查找对应的客户端会话 (现在是 SessionManager 类型的方法)
+func (sm *SessionManager) GetSession(clientIP string) *clientSession {
 	sm.RLock()
 	defer sm.RUnlock()
 	return sm.sessions[clientIP]
@@ -68,8 +71,6 @@ func readFromTunAndDistribute() {
 		}
 
 		// --- IP包解析和路由 ---
-		// 这是一个简化的IPv4头部解析，仅获取目标IP地址。
-		// IPv4包的第16到19字节是目标地址。
 		if n < 20 {
 			continue // 包太小，不是有效的IPv4包
 		}
@@ -79,19 +80,14 @@ func readFromTunAndDistribute() {
 		// 根据目标IP查找对应的客户端会话
 		session := sessionManager.GetSession(destIP)
 		if session != nil {
-			// 必须复制一份数据，因为packet缓冲区是全局复用的。
-			// 如果不复制，下一个循环的Read操作会覆盖掉数据。
 			packetCopy := make([]byte, n)
 			copy(packetCopy, packet[:n])
 
-			// 使用非阻塞方式发送，防止某个慢客户端阻塞整个分发器
 			select {
 			case session.packetChan <- packetCopy:
-				// 数据包成功发送给对应的客户端处理协程
 			default:
 				log.Printf("WARN: Client channel for %s is full. Packet dropped.", destIP)
 			}
 		}
-		// 如果找不到会话，静默丢弃该包。这很正常，例如网络扫描或广播包。
 	}
 }
