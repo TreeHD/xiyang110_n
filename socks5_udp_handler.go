@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt" // [核心修正] 添加回 fmt 包的导入
 	"io"
 	"log"
 	"net"
@@ -82,7 +83,7 @@ func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 			destPort := binary.BigEndian.Uint16(data[4:6])
 			payload := data[6:]
 
-			destAddrStr := net.JoinHostPort(destIP.String(), fmt.Sprintf("%d", destPort))
+			destAddrStr := fmt.Sprintf("%s:%d", destIP.String(), destPort)
 			destAddr, err := net.ResolveUDPAddr("udp", destAddrStr)
 			if err != nil {
 				continue
