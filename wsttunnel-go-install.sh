@@ -159,8 +159,8 @@ LimitNOFILE=65536
 # --- [关键更新] 赋予程序创建TUN设备和配置网络的权限 ---
 # CAP_NET_ADMIN: 允许执行网络管理任务，如配置接口、路由、iptables。
 # CAP_NET_RAW: 允许创建RAW套接字，某些网络诊断工具可能需要。
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
