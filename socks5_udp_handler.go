@@ -10,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"golang.orgx/crypto/ssh"
+    // [核心修正] 将 golang.orgx 改为 golang.org
+	"golang.org/x/crypto/ssh" 
 )
 
 // udpSession a udp session (struct name changed for clarity)
@@ -47,7 +48,7 @@ func delUDPSession(clientAddr string) {
 }
 
 
-// handleSocks5UDP 是新的、健 robuste SOCKS5 UDP处理器
+// handleSocks5UDP 是新的、健壮的SOCKS5 UDP处理器
 func handleSocks5UDP(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
 	log.Printf("SOCKS5 UDP: New session for %s", clientKey)
