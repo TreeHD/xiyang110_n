@@ -1,4 +1,4 @@
-// simple_udp_handler.go
+// final_udp_handler.go
 package main
 
 import (
@@ -13,133 +13,97 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// activeUDPConnections 跟踪每个客户端的UDP连接
-var activeUDPConnections = struct {
+var udpConnections = struct {
 	sync.RWMutex
-	conns map[string]net.PacketConn
+	m map[string]net.PacketConn
 }{
-	conns: make(map[string]net.PacketConn),
+	m: make(map[string]net.PacketConn),
 }
 
-func addUDPConn(clientKey string, conn net.PacketConn) {
-	activeUDPConnections.Lock()
-	defer activeUDPConnections.Unlock()
-	activeUDPConnections.conns[clientKey] = conn
+func addConn(clientKey string, conn net.PacketConn) {
+	udpConnections.Lock()
+	defer udpConnections.Unlock()
+	udpConnections.m[clientKey] = conn
 }
 
-func getUDPConn(clientKey string) net.PacketConn {
-	activeUDPConnections.RLock()
-	defer activeUDPConnections.RUnlock()
-	return activeUDPConnections.conns[clientKey]
+func getConn(clientKey string) net.PacketConn {
+	udpConnections.RLock()
+	defer udpConnections.RUnlock()
+	return udpConnections.m[clientKey]
 }
 
-func delUDPConn(clientKey string) {
-	activeUDPConnections.Lock()
-	defer activeUDPConnections.Unlock()
-	if conn, ok := activeUDPConnections.conns[clientKey]; ok {
+func delConn(clientKey string) {
+	udpConnections.Lock()
+	defer udpConnections.Unlock()
+	if conn, ok := udpConnections.m[clientKey]; ok {
 		conn.Close()
-		delete(activeUDPConnections.conns, clientKey)
+		delete(udpConnections.m, clientKey)
 	}
 }
 
-// handleCustomUDP 是最终的、最简化的UDP处理器
-func handleCustomUDP(ch ssh.Channel, remoteAddr net.Addr) {
+func handleFinalUDP(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
-	log.Printf("Custom UDP Proxy: New session for %s", clientKey)
-	defer log.Printf("Custom UDP Proxy: Session for %s closed", clientKey)
+	log.Printf("Final UDP Proxy: New session for %s", clientKey)
+	defer log.Printf("Final UDP Proxy: Session for %s closed", clientKey)
 	defer ch.Close()
 
-	// 为每个客户端创建一个独立的UDP套接字
 	udpConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
-		log.Printf("Custom UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
+		log.Printf("Final UDP Proxy: Failed to listen on UDP port for %s: %v", clientKey, err)
 		return
 	}
 	defer udpConn.Close()
-	addUDPConn(clientKey, udpConn)
-	defer delUDPConn(clientKey)
+	addConn(clientKey, udpConn)
+	defer delConn(clientKey)
 
 	done := make(chan struct{})
-
-	// Goroutine 1: 从SSH读取，解析，并发送UDP包
+	
+	// Goroutine 1: 从SSH读取、解析、发送
 	go func() {
-		defer func() {
-			close(done) // 关闭done chan通知另一个goroutine退出
-		}()
+		defer close(done)
 		for {
-			// 1. 读取地址类型 (1 byte)
-			addrType := make([]byte, 1)
-			if _, err := io.ReadFull(ch, addrType); err != nil {
-				return
-			}
-
-			var host string
-			switch addrType[0] {
-			case 0x01: // IPv4
-				addr := make([]byte, 4)
-				if _, err := io.ReadFull(ch, addr); err != nil { return }
-				host = net.IP(addr).String()
-			case 0x03: // 域名
-				lenByte := make([]byte, 1)
-				if _, err := io.ReadFull(ch, lenByte); err != nil { return }
-				domain := make([]byte, lenByte[0])
-				if _, err := io.ReadFull(ch, domain); err != nil { return }
-				host = string(domain)
-			case 0x04: // IPv6
-				addr := make([]byte, 16)
-				if _, err := io.ReadFull(ch, addr); err != nil { return }
-				host = net.IP(addr).String()
-			default:
-				log.Printf("Custom UDP Proxy: Unsupported address type from %s: %d", clientKey, addrType[0])
-				return
-			}
-
-			// 2. 读取端口 (2 bytes)
-			portBytes := make([]byte, 2)
-			if _, err := io.ReadFull(ch, portBytes); err != nil { return }
-			port := binary.BigEndian.Uint16(portBytes)
-			
-			// 3. 读取数据 (最关键的部分)
-			// 假设数据包以一个2字节的长度开头
+			// 1. 读取2字节的总长度
 			lenBytes := make([]byte, 2)
 			if _, err := io.ReadFull(ch, lenBytes); err != nil {
 				return
 			}
-			dataLen := binary.BigEndian.Uint16(lenBytes)
+			totalLen := binary.BigEndian.Uint16(lenBytes)
 
-			if dataLen > 4096 { // 增加一个合理的限制
-				log.Printf("Custom UDP Proxy: Oversized payload (%d) from %s", dataLen, clientKey)
+			if totalLen < 6 { // 至少要有 IP(4) + Port(2)
+				log.Printf("Final UDP Proxy: Invalid packet length %d from %s", totalLen, clientKey)
 				return
 			}
 
-			payload := make([]byte, dataLen)
-			if _, err := io.ReadFull(ch, payload); err != nil {
+			// 2. 读取剩余的全部数据
+			data := make([]byte, totalLen)
+			if _, err := io.ReadFull(ch, data); err != nil {
 				return
 			}
-			
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
-			if err != nil {
-				continue
-			}
-			
-			_, err = udpConn.WriteTo(payload, destAddr)
-			if err != nil {
-				log.Printf("Custom UDP Proxy: Failed to write to %s: %v", destAddr, err)
+
+			// 3. 从数据中解析出地址、端口和负载
+			destIP := net.IP(data[0:4])
+			destPort := binary.BigEndian.Uint16(data[4:6])
+			payload := data[6:]
+
+			destAddr := &net.UDPAddr{IP: destIP, Port: int(destPort)}
+
+			// 4. 发送UDP包
+			if _, err := udpConn.WriteTo(payload, destAddr); err != nil {
+				log.Printf("Final UDP Proxy: Error writing to %s for %s: %v", destAddr, clientKey, err)
 			}
 		}
 	}()
-
-	// Goroutine 2: 从UDP套接字读取返回数据，封装并发送回客户端
+	
+	// Goroutine 2: 从UDP套接字读取返回，封装并发送回客户端
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			// 检查是否应该退出
 			select {
 			case <-done:
 				return
 			default:
 			}
-			
+
 			udpConn.SetReadDeadline(time.Now().Add(120 * time.Second))
 			n, remote, err := udpConn.ReadFrom(buf)
 			if err != nil {
@@ -148,36 +112,29 @@ func handleCustomUDP(ch ssh.Channel, remoteAddr net.Addr) {
 				}
 				return
 			}
-
-			udpRemote := remote.(*net.UDPAddr)
 			
-			// 封装回包
-			var header []byte
-			if ip4 := udpRemote.IP.To4(); ip4 != nil {
-				header = append(header, 0x01)
-				header = append(header, ip4...)
-			} else if ip16 := udpRemote.IP.To16(); ip16 != nil {
-				header = append(header, 0x04)
-				header = append(header, ip16...)
-			} else {
-				continue // 不支持的地址类型
+			udpRemote := remote.(*net.UDPAddr)
+			remoteIP := udpRemote.IP.To4()
+			if remoteIP == nil {
+				continue // 只处理IPv4
 			}
 
-			portBytes := make([]byte, 2)
-			binary.BigEndian.PutUint16(portBytes, uint16(udpRemote.Port))
-			header = append(header, portBytes...)
-
-			lenBytes := make([]byte, 2)
-			binary.BigEndian.PutUint16(lenBytes, uint16(n))
-			header = append(header, lenBytes...)
+			// 封装回包: [2字节总长][4字节源IP][2字节源端口][数据]
+			payload := buf[:n]
+			totalLen := 4 + 2 + len(payload)
 			
-			fullFrame := append(header, buf[:n]...)
+			frame := make([]byte, 2+totalLen)
+			
+			binary.BigEndian.PutUint16(frame[0:2], uint16(totalLen))
+			copy(frame[2:6], remoteIP)
+			binary.BigEndian.PutUint16(frame[6:8], uint16(udpRemote.Port))
+			copy(frame[8:], payload)
 
-			if _, err := ch.Write(fullFrame); err != nil {
+			if _, err := ch.Write(frame); err != nil {
 				return
 			}
 		}
 	}()
-	
+
 	<-done
 }
