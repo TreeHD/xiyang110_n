@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath" // *** 新增导入 ***
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,17 +25,16 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 (无变化) ---
 type AccountInfo struct { Password, ExpiryDate string; Enabled bool }
 type Config struct {
-	ListenAddr, UdpgwAddr, AdminAddr, ConnectUA string // *** 修改: UdpSocksAddr -> UdpgwAddr ***
+	ListenAddr, UdpgwAddr, AdminAddr, ConnectUA string
 	SocksAddrs []string
 	AdminAccounts map[string]string
 	Accounts map[string]AccountInfo
 	HandshakeTimeout, BufferSizeKB, IdleTimeoutSeconds, HealthCheckInterval, ConnectionPoolSize int
 	lock sync.RWMutex
 }
-
 var globalConfig *Config
 var activeConn int64
 type OnlineUser struct { ConnID, Username, RemoteAddr string; ConnectTime time.Time; sshConn ssh.Conn }
@@ -48,44 +50,35 @@ var poolLock sync.RWMutex
 var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024); return &b }}
 
 
-// --- handleSshConnection (采用方案一: 模仿旧架构) ---
-func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
-	handshakedConn, err := httpHandshake(c)
-	if err != nil { log.Printf("http handshake failed for %s: %v", c.RemoteAddr(), err); return }
-	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
-	if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); return }
-	defer sshConn.Close()
-	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
-	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
-	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }
-	addOnlineUser(onlineUser)
-	// *** 修正日志笔误 ***
-	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
-	defer removeOnlineUser(connID)
-	go ssh.DiscardRequests(reqs)
-	for newChan := range chans {
-		if newChan.ChannelType() != "direct-tcpip" { newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed"); continue }
-		ch, _, err := newChan.Accept()
-		if err != nil { log.Printf("accept channel fail: %v", err); continue }
-		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
-		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
-		
-		// ================== 全新的、更简单的劫持逻辑 ==================
-		if payload.Host == "127.0.0.1" && payload.Port == 7300 {
-			if globalConfig.UdpgwAddr == "" {
-				log.Printf("ERROR: Hijacked UDP stream but 'udpgw_addr' is not configured. Closing connection for user '%s'.", sshConn.User())
-				ch.Close()
-				continue
-			}
-			log.Printf("Hijacking and forwarding stream to udpgw for user '%s'", sshConn.User())
-			go forwardToUdpgw(ch, globalConfig.UdpgwAddr)
-		} else {
-			log.Printf("Handling standard direct-tcpip to %s:%d for user '%s'", payload.Host, payload.Port, sshConn.User())
-			go handleDirectTCPIP(ch, payload.Host, payload.Port)
-		}
-		// =============================================================
+// ==============================================================================
+// === 核心修正: 健壮的配置文件加载逻辑 ===
+// ==============================================================================
+func findAndReadConfig() ([]byte, error) {
+	// 方案1: 检查标准绝对路径
+	const absolutePath = "/etc/wstunnel/config.json"
+	if _, err := os.Stat(absolutePath); err == nil {
+		log.Printf("Found config file at standard location: %s", absolutePath)
+		return os.ReadFile(absolutePath)
 	}
+
+	// 方案2: 寻找可执行文件同目录下的配置文件
+	exePath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("could not determine executable path: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	relativePath := filepath.Join(exeDir, "config.json")
+	if _, err := os.Stat(relativePath); err == nil {
+		log.Printf("Found config file relative to executable: %s", relativePath)
+		return os.ReadFile(relativePath)
+	}
+
+	return nil, fmt.Errorf("config.json not found in %s or %s", absolutePath, relativePath)
 }
+
+
+// ... (所有其他函数，如 handleSshConnection, forwardToUdpgw 等，都保持上一份方案一的代码不变)
+// ... 我将粘贴完整的、正确的代码在下面 ...
 
 // forwardToUdpgw 将流量透明转发给 udpgw 服务
 func forwardToUdpgw(ch ssh.Channel, udpgwAddr string) {
@@ -100,20 +93,51 @@ func forwardToUdpgw(ch ssh.Channel, udpgwAddr string) {
 
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if tcpConn, ok := udpgwConn.(*net.TCPConn); ok { tcpConn.CloseWrite() }
+			close(done)
+		}()
 		io.Copy(udpgwConn, ch)
-		// 关闭写方向，通知对端
-		if tcpConn, ok := udpgwConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		}
-		close(done)
 	}()
 	io.Copy(ch, udpgwConn)
 	<-done
 }
 
-// ==============================================================================
-// === 其余所有代码都保持原样（除了main函数中的配置加载） ===
-// ==============================================================================
+// handleSshConnection (采用方案一: 模仿旧架构)
+func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
+	handshakedConn, err := httpHandshake(c)
+	if err != nil { log.Printf("http handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
+	if err != nil { log.Printf("ssh handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	defer sshConn.Close()
+	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
+	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
+	onlineUser := &OnlineUser{ ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn, }
+	addOnlineUser(onlineUser)
+	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
+	defer removeOnlineUser(connID)
+	go ssh.DiscardRequests(reqs)
+	for newChan := range chans {
+		if newChan.ChannelType() != "direct-tcpip" { newChan.Reject(ssh.UnknownChannelType, "only direct-tcpip allowed"); continue }
+		ch, _, err := newChan.Accept()
+		if err != nil { log.Printf("accept channel fail: %v", err); continue }
+		var payload struct { Host string; Port uint32; OriginAddr string; OriginPort uint32 }
+		if err := ssh.Unmarshal(newChan.ExtraData(), &payload); err != nil { log.Printf("bad payload: %v", err); ch.Close(); continue }
+		
+		if payload.Host == "127.0.0.1" && payload.Port == 7300 {
+			if globalConfig.UdpgwAddr == "" {
+				log.Printf("ERROR: Hijacked UDP stream but 'udpgw_addr' is not configured. Closing connection for user '%s'.", sshConn.User())
+				ch.Close()
+				continue
+			}
+			log.Printf("Hijacking and forwarding stream to udpgw for user '%s'", sshConn.User())
+			go forwardToUdpgw(ch, globalConfig.UdpgwAddr)
+		} else {
+			log.Printf("Handling standard direct-tcpip to %s:%d for user '%s'", payload.Host, payload.Port, sshConn.User())
+			go handleDirectTCPIP(ch, payload.Host, payload.Port)
+		}
+	}
+}
 
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32) {
 	atomic.AddInt64(&activeConn, 1); defer atomic.AddInt64(&activeConn, -1)
@@ -286,7 +310,9 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func main() {
-	configFile, err := os.ReadFile("config.json"); if err != nil { log.Fatalf("FATAL: 无法读取 config.json: %v", err) }
+	configFile, err := findAndReadConfig() // *** 使用健壮的配置加载逻辑 ***
+	if err != nil { log.Fatalf("FATAL: 无法找到或读取配置文件: %v", err) }
+
 	globalConfig = &Config{}; err = json.Unmarshal(configFile, globalConfig); if err != nil { log.Fatalf("FATAL: 解析 config.json 失败: %v", err) }
 	if globalConfig.ListenAddr == "" || len(globalConfig.SocksAddrs) == 0 || len(globalConfig.AdminAccounts) == 0 { log.Fatalf("FATAL: config.json 缺少 listen_addr, socks_addrs 或 admin_accounts") }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
