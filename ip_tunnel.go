@@ -7,23 +7,28 @@ import (
 	"net"
 	"sync"
 
-	"github.com/songgao/water"
+	"github.com.songgao/water"
 	"golang.org/x/crypto/ssh"
 )
 
 var tunInterface *water.Interface
 var tunMutex sync.Mutex // 仅用于保护TUN接口的并发写入
 
-// createTunDevice 函数保持不变，这里省略以保持简洁
+// createTunDevice - 回归到最简单的默认配置
 func createTunDevice() error {
 	const (
 		ifaceName = "tun0"
 		ifaceAddr = "10.0.0.1/24"
 	)
+	// 使用 water 库的默认配置，让它自动处理PI头
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
 	config.Name = ifaceName
+
+	// [重要] 删除所有关于 Pi = false 的设置，使用库的默认行为
+	// water 库会为我们处理好一切
+
 	ifce, err := water.New(config)
 	if err != nil {
 		return fmt.Errorf("failed to create TUN device: %w", err)
@@ -50,69 +55,68 @@ func createTunDevice() error {
 	return nil
 }
 
-// handleIPTunnel 处理来自客户端的IP隧道流量
+// handleIPTunnel - 简化到只处理纯粹的IP包
 func handleIPTunnel(ch ssh.Channel, remoteAddr net.Addr) {
 	clientKey := remoteAddr.String()
 	log.Printf("IP Tunnel: New session for %s. Waiting for first packet to determine client IP.", clientKey)
 	defer log.Printf("IP Tunnel: Session for %s closed", clientKey)
 	defer ch.Close()
 
-	// 为这个客户端创建一个带缓冲的channel，用于接收从TUN来的包
 	packetChan := make(chan []byte, 100)
 	session := &clientSession{packetChan: packetChan}
-
-	// 这个变量将存储客户端在TUN网络中的IP地址
 	var clientTunIP string
-	// 使用defer确保无论函数如何退出，会话都会被注销
 	defer func() {
 		sessionManager.Unregister(clientTunIP)
 	}()
 
 	done := make(chan struct{})
 
-	// Goroutine 1: 从自己的packet channel读取数据，写入SSH信道 (TUN -> SSH)
+	// Goroutine 1: 从自己的packet channel读取纯IP包，直接写入SSH信道 (TUN -> SSH)
 	go func() {
-		for packet := range packetChan {
-			// 直接将原始IP包写入SSH channel
-			if _, err := ch.Write(packet); err != nil {
+		for ipPacket := range packetChan {
+			if _, err := ch.Write(ipPacket); err != nil {
 				log.Printf("IP Tunnel: Error writing to SSH channel for %s: %v", clientKey, err)
 				return
 			}
 		}
 	}()
 
-	// Goroutine 2: 从SSH信道读取数据，写入TUN设备 (SSH -> TUN)
+	// Goroutine 2: 从SSH信道读取纯IP包，直接写入TUN设备 (SSH -> TUN)
 	go func() {
-		defer close(done) // 此goroutine退出时，关闭done channel通知主goroutine
+		defer close(done)
 
 		packet := make([]byte, 4096)
 		isRegistered := false
 
 		for {
-			// 直接从SSH channel读取一个原始IP包
 			n, err := ch.Read(packet)
 			if err != nil {
-				// 任何读取错误（包括EOF）都意味着连接已关闭
 				return
 			}
 
 			if n > 0 {
-				// --- 动态识别并注册客户端IP ---
+				// 假设从SSH读到的就是纯IP包
+				ipPacket := packet[:n]
+
 				if !isRegistered {
-					if n < 20 {
-						continue // 包太小，无法解析IP
+					if len(ipPacket) < 20 {
+						continue // 不是有效的IPv4包
 					}
-					// 从客户端发来的第一个IP包中，提取其源IP地址
-					// IPv4包的第12到15字节是源地址
-					srcIP := net.IP(packet[12:16]).String()
-					clientTunIP = srcIP // 存储IP以供defer注销时使用
+					// 从纯IP包中提取源IP地址
+					srcIP := net.IP(ipPacket[12:16]).String()
+					// 增加一个IP有效性检查
+					if srcIP == "0.0.0.0" {
+						log.Printf("WARN: Received packet with invalid source IP 0.0.0.0 from %s. Ignoring.", clientKey)
+						continue
+					}
+					clientTunIP = srcIP
 					sessionManager.Register(clientTunIP, session)
 					isRegistered = true
 				}
 
-				// 将数据包写入全局TUN设备，加锁以防止并发写入冲突
 				tunMutex.Lock()
-				_, writeErr := tunInterface.Write(packet[:n])
+				// 将纯IP包交给water库，它会处理好与内核的交互
+				_, writeErr := tunInterface.Write(ipPacket)
 				tunMutex.Unlock()
 				if writeErr != nil {
 					log.Printf("IP Tunnel: Error writing to TUN device: %v", writeErr)
@@ -122,6 +126,5 @@ func handleIPTunnel(ch ssh.Channel, remoteAddr net.Addr) {
 		}
 	}()
 
-	// 等待任一方向的连接关闭
 	<-done
 }
