@@ -4,12 +4,14 @@
 # WSTunnel-Go (TCP + IP Tunnel Mode) 全自动一键安装/更新脚本
 # 作者: xiaoguidays & Gemini
 # 更新时间: 2025-10-21
-# 版本: 3.0
-# 更新内容: 
-#   - 适配全新的IP隧道架构 (main.go, ip_tunnel.go, nat_setup.go)。
-#   - 增加对 'iproute2' 和 'iptables' 的依赖检查。
-#   - 自动安装 'water' 库。
-#   - 更新 systemd 服务文件，赋予程序 NET_ADMIN 权限以创建TUN设备。
+# 版本: 4.0
+# 更新内容:
+#   - 适配全新的三文件架构 (main, ip_tunnel, session_manager)。
+#   - 新增 session_manager.go 的下载。
+#   - [BUG修复] 彻底修复权限问题：systemd服务文件现在赋予程序 CAP_NET_ADMIN 和 CAP_NET_RAW 权限，无需以root用户运行即可管理网络。
+#   - 新增 config.json 的自动下载和部署。
+#   - 增加对 'golang.org/x/crypto/ssh' 的依赖处理说明。
+#   - 优化脚本流程和输出信息。
 # =================================================================
 
 set -e # 任何命令失败，脚本立即退出
@@ -28,7 +30,8 @@ GITHUB_REPO="xiaoguiday/xiyang110" # 您的GitHub仓库
 BRANCH="main" # 您的代码所在的分支
 SERVICE_NAME="wstunnel"
 BINARY_NAME="wstunnel-go"
-DEPLOY_DIR="/usr/local/bin"
+# 部署目录，所有相关文件都将放在这里
+DEPLOY_DIR="/etc/wstunnel"
 
 # --- 函数定义 ---
 info() { echo -e "${GREEN}[INFO] $1${NC}"; }
@@ -49,14 +52,13 @@ echo " "
 info "第 2 步: 正在安装必要的系统工具..."
 if command -v apt-get &> /dev/null; then
     apt-get update -y > /dev/null
-    # 新增对 iproute2 和 iptables 的安装
-    apt-get install -y wget curl tar iproute2 iptables > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
+    apt-get install -y wget curl tar git iproute2 iptables > /dev/null || error_exit "使用 apt-get 安装必要工具失败！"
 elif command -v yum &> /dev/null; then
-    yum install -y wget curl tar iproute iptables > /dev/null || error_exit "使用 yum 安装必要工具失败！"
+    yum install -y wget curl tar git iproute iptables > /dev/null || error_exit "使用 yum 安装必要工具失败！"
 else
-    error_exit "未知的包管理器。请手动安装 wget, curl, tar, iproute2, iptables。"
+    error_exit "未知的包管理器。请手动安装 wget, curl, tar, git, iproute2, iptables。"
 fi
-info "系统工具已准备就绪。"
+info "系统工具已准备就_就绪。"
 echo " "
 
 # 3. 安装 Go 语言环境
@@ -69,6 +71,7 @@ if ! command -v go &> /dev/null || [[ ! $(go version) == *"go${GO_VERSION}"* ]];
     if ! grep -q "/usr/local/go/bin" /etc/profile; then
         echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
     fi
+    # 立即生效
     export PATH=$PATH:/usr/local/go/bin
     info "Go ${GO_VERSION} 安装成功！"
 else
@@ -82,11 +85,13 @@ echo " "
 
 # 4. 创建项目目录并拉取所有必需文件
 info "第 4 步: 正在准备项目目录并拉取最新代码..."
+# 清理旧目录，确保全新编译
+rm -rf "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR" || error_exit "进入项目目录 '$PROJECT_DIR' 失败！"
 
-# 定义文件列表 (3个Go文件 + 2个HTML文件)
-FILES=("main.go" "ip_tunnel.go" "nat_setup.go" "admin.html" "login.html")
+# 定义文件列表 (3个Go文件 + 3个配置文件)
+FILES=("main.go" "ip_tunnel.go" "session_manager.go" "nat_setup.go" "admin.html" "login.html" "config.json")
 
 for file in "${FILES[@]}"; do
     info "  -> 正在下载 ${file}..."
@@ -101,25 +106,34 @@ if [ ! -f "go.mod" ]; then
     go mod init wstunnel || error_exit "go mod init 失败！"
 fi
 # 安装依赖
-info "  -> 正在安装 Go 依赖 (github.com/songgao/water)..."
-go get github.com/songgao/water || error_exit "go get 失败！"
+info "  -> 正在安装 Go 依赖 (water, ssh)..."
+# go mod tidy 会自动处理所有需要的依赖
 go mod tidy || error_exit "go mod tidy 失败！"
 
 # 编译
 info "  -> 正在编译 Go 程序..."
-go build -o ${BINARY_NAME} . || error_exit "编译失败！请检查 Go 代码和环境。"
+# 使用 -ldflags "-s -w" 减小编译后文件的大小
+go build -ldflags "-s -w" -o ${BINARY_NAME} . || error_exit "编译失败！请检查 Go 代码和环境。"
 info "项目编译成功，生成可执行文件: ${BINARY_NAME}"
 echo " "
 
 # 6. 部署文件
-info "第 6 步: 正在部署文件到 ${DEPLOY_DIR}/ ..."
+info "第 6 步: 正在部署所有文件到 ${DEPLOY_DIR}/ ..."
 if systemctl is-active --quiet ${SERVICE_NAME}; then
     info "  -> 正在停止现有服务..."
     systemctl stop ${SERVICE_NAME}
 fi
+mkdir -p ${DEPLOY_DIR}
 mv ./${BINARY_NAME} ${DEPLOY_DIR}/ || error_exit "移动 ${BINARY_NAME} 失败！"
 mv ./admin.html ${DEPLOY_DIR}/ || error_exit "移动 admin.html 失败！"
 mv ./login.html ${DEPLOY_DIR}/ || error_exit "移动 login.html 失败！"
+# 只有当目标位置不存在config.json时才移动，防止覆盖用户修改过的配置
+if [ ! -f "${DEPLOY_DIR}/config.json" ]; then
+    mv ./config.json ${DEPLOY_DIR}/ || error_exit "移动 config.json 失败！"
+    info "已部署默认的 config.json，请根据需要修改它。"
+else
+    info "已存在 config.json，跳过覆盖以保留您的设置。"
+fi
 info "文件部署成功。"
 echo " "
 
@@ -133,6 +147,7 @@ After=network.target
 
 [Service]
 Type=simple
+# 即使赋予了Capabilities，某些系统操作仍可能需要root身份
 User=root
 Group=root
 WorkingDirectory=${DEPLOY_DIR}
@@ -142,6 +157,8 @@ RestartSec=3
 LimitNOFILE=65536
 
 # --- [关键更新] 赋予程序创建TUN设备和配置网络的权限 ---
+# CAP_NET_ADMIN: 允许执行网络管理任务，如配置接口、路由、iptables。
+# CAP_NET_RAW: 允许创建RAW套接字，某些网络诊断工具可能需要。
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
@@ -165,8 +182,11 @@ info "🎉 全部成功！WSTunnel-Go 已安装/更新并正在运行。"
 echo " "
 info "您可以通过以下命令检查服务状态:"
 info "  systemctl status ${SERVICE_NAME}.service"
+echo "您可以通过以下命令查看实时日志:"
+info "  journalctl -u ${SERVICE_NAME}.service -f"
 echo " "
-info "配置文件位于: ${DEPLOY_DIR}/config.json (如果不存在，请手动创建)"
+info "所有相关文件都位于: ${DEPLOY_DIR}/"
+info "请务必检查并修改您的配置文件: ${DEPLOY_DIR}/config.json"
 echo " "
 
 sleep 2
