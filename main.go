@@ -37,13 +37,12 @@ type Config struct {
 	HandshakeTimeout   int                    `json:"handshake_timeout,omitempty"`
 	ConnectUA          string                 `json:"connect_ua,omitempty"`
 	BufferSizeKB       int                    `json:"buffer_size_kb,omitempty"`
-	IdleTimeoutSeconds int                    `json:"idle_timeout_seconds,omitempty"`
+	IdleTimeoutSeconds int                    `json:"idle_timeout_seconds,omitempty"` // 注意：此版本代码将不再使用此配置
 	lock               sync.RWMutex
 }
 
 var globalConfig *Config
 var activeConn int64
-
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
 	Username    string    `json:"username"`
@@ -51,7 +50,6 @@ type OnlineUser struct {
 	ConnectTime time.Time `json:"connect_time"`
 	sshConn     ssh.Conn
 }
-
 var onlineUsers sync.Map
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct {
@@ -97,40 +95,9 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-// --- 核心数据转发逻辑 (无变动) ---
-var bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024); return &b }}
-func timedCopy(dst io.Writer, src io.Reader, timeout time.Duration) (written int64, err error) {
-	bufPtr := bufferPool.Get().(*[]byte)
-	defer bufferPool.Put(bufPtr)
-	buf := *bufPtr
-	for {
-		if srcConn, ok := src.(net.Conn); ok {
-			if err := srcConn.SetReadDeadline(time.Now().Add(timeout)); err != nil { return written, err }
-		}
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			if dstConn, ok := dst.(net.Conn); ok {
-				if err := dstConn.SetWriteDeadline(time.Now().Add(timeout)); err != nil { return written, err }
-			}
-			nw, ew := dst.Write(buf[0:nr])
-			if nw < 0 || nr < nw {
-				nw = 0
-				if ew == nil { ew = io.ErrShortWrite }
-			}
-			written += int64(nw)
-			if ew != nil { err = ew; break }
-			if nr != nw { err = io.ErrShortWrite; break }
-		}
-		if er != nil {
-			if netErr, ok := er.(net.Error); ok && netErr.Timeout() { err = nil } else { err = er }
-			break
-		}
-	}
-	return written, err
-}
 
-
-// --- handleDirectTCPIP (核心修改) ---
+// --- 核心数据转发逻辑 (重大修改) ---
+// 移除了 timedCopy 和 bufferPool，因为 io.Copy 内置了优化的缓冲
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -142,72 +109,44 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
 
-	const maxRetries = 10 // 最大重连次数，-1为无限
-	const retryInitialDelay = 1 * time.Second
-	retryDelay := retryInitialDelay
-
-	for i := 0; maxRetries == -1 || i < maxRetries; i++ {
-		// 1. 尝试连接目标
-		log.Printf("Attempting to connect to %s for %s (attempt %d)...", destAddr, remoteAddr, i+1)
-		destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
-		if err != nil {
-			log.Printf("Failed to connect to %s: %v. Retrying in %v...", destAddr, err, retryDelay)
-			time.Sleep(retryDelay)
-			retryDelay *= 2 // Exponential backoff
-			if retryDelay > 30*time.Second {
-				retryDelay = 30 * time.Second // Cap delay at 30s
-			}
-			continue
-		}
-
-		// 2. 连接成功，设置参数并重置重试延迟
-		log.Printf("Connection to %s established.", destAddr)
-		retryDelay = retryInitialDelay // Reset delay after successful connection
-		
-		if tcpConn, ok := destConn.(*net.TCPConn); ok {
-			tcpConn.SetNoDelay(true)
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(1 * time.Minute)
-		}
-
-		// 3. 开始双向数据转发，并监控错误
-		errChan := make(chan error, 2)
-		idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
-
-		go func() {
-			_, err := timedCopy(destConn, ch, idleTimeout)
-			errChan <- err
-		}()
-		go func() {
-			_, err := timedCopy(ch, destConn, idleTimeout)
-			errChan <- err
-		}()
-
-		// 4. 等待第一个错误发生
-		err = <-errChan
-		destConn.Close() // 无论什么错误，先关闭当前连接
-
-		// 5. 分析错误并决定是退出还是重连
-		if err == io.EOF {
-			// 通常意味着客户端(ch)主动关闭了连接，这是正常退出，不需要重连
-			log.Printf("Client %s closed the channel to %s. Terminating.", remoteAddr, destAddr)
-			return // 彻底退出函数
-		}
-		if err != nil {
-			// 发生了其他网络错误，大概率是到udpgw的连接断了
-			log.Printf("Connection to %s broke: %v. Will attempt to reconnect.", destAddr, err)
-			// 不需要做什么，外部的for循环会自动处理重连
-		} else {
-			// timedCopy因为超时正常退出，我们也认为可以正常结束
-			log.Printf("Idle timeout reached for connection to %s. Terminating.", destAddr)
-			return
-		}
+	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
+	if err != nil {
+		log.Printf("TCP Proxy: Failed to connect to %s: %v", destAddr, err)
+		ch.Close()
+		return
 	}
-	log.Printf("Failed to maintain connection to %s for %s after %d retries. Giving up.", destAddr, remoteAddr, maxRetries)
+	
+	if tcpConn, ok := destConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(1 * time.Minute)
+	}
+	
+	log.Printf("Starting bidirectional copy between %s and %s", remoteAddr, destAddr)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		defer destConn.Close()
+		defer ch.Close()
+		io.Copy(destConn, ch)
+	}()
+	
+	go func() {
+		defer wg.Done()
+		defer ch.Close()
+		defer destConn.Close()
+		io.Copy(ch, destConn)
+	}()
+
+	wg.Wait()
+	log.Printf("Bidirectional copy finished between %s and %s", remoteAddr, destAddr)
 }
 
 
-// --- SSH & HTTP 握手与连接管理 (无变动) ---
+// --- SSH & HTTP 握手与连接管理 (使用上一版的SSH握手超时) ---
 type combinedConn struct {
 	net.Conn
 	reader io.Reader
@@ -253,8 +192,15 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	handshakedConn, err := httpHandshake(c)
 	if err != nil { log.Printf("HTTP handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	sshHandshakeTimeout := 15 * time.Second
+	if err := handshakedConn.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
+		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err); return
+	}
 	sshConn, chans, reqs, err := ssh.NewServerConn(handshakedConn, sshCfg)
 	if err != nil { log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err); return }
+	if err := handshakedConn.SetDeadline(time.Time{}); err != nil {
+		log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err); sshConn.Close(); return
+	}
 	defer sshConn.Close()
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
@@ -339,8 +285,8 @@ func main() {
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
 	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 128 }
 	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 90 }
-	bufferPool = sync.Pool{New: func() interface{} { b := make([]byte, globalConfig.BufferSizeKB*1024); return &b }}
-	log.Println("====== WSTUNNEL (Pure TCP Proxy Mode) Starting ======"); log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds", globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
+	// bufferPool is no longer needed
+	log.Println("====== WSTUNNEL (Pure TCP Proxy Mode) Starting ======"); log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds (Note: IdleTimeout is not used in this version)", globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 	go func() {
 		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
 	}()
