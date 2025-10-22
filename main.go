@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"bytes" // <-- 引入bytes包
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -22,7 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 (无变动) ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -43,7 +44,6 @@ type Config struct {
 
 var globalConfig *Config
 var activeConn int64
-
 type OnlineUser struct {
 	ConnID      string    `json:"conn_id"`
 	Username    string    `json:"username"`
@@ -51,7 +51,6 @@ type OnlineUser struct {
 	ConnectTime time.Time `json:"connect_time"`
 	sshConn     ssh.Conn
 }
-
 var onlineUsers sync.Map
 const sessionCookieName = "wstunnel_admin_session"
 type Session struct {
@@ -61,20 +60,18 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// handshakeConn 是一个包装器，用于安全地将 bufio.Reader 传递给 ssh.NewServerConn
+// --- handshakeConn 定义 ---
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
 }
-
 func (hc *handshakeConn) Read(p []byte) (n int, err error) {
 	return hc.r.Read(p)
 }
 
-// --- 辅助函数 ---
+// --- 辅助函数 (无变动) ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
-
 func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32)
 	rand.Read(sessionTokenBytes)
@@ -85,7 +82,6 @@ func createSession(username string) *http.Cookie {
 	sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
-
 func validateSession(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil { return false }
@@ -102,7 +98,6 @@ func validateSession(r *http.Request) bool {
 	}
 	return true
 }
-
 func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, _ := json.Marshal(payload)
 	w.Header().Set("Content-Type", "application/json")
@@ -167,13 +162,12 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 				return
 			}
 		case <-done:
-			log.Printf("Keepalive for %s stopped.", sshConn.RemoteAddr())
 			return
 		}
 	}
 }
 
-// handleSshConnection - 融合了稳定握手逻辑的最终版本
+// handleSshConnection - 终极优化版：手动解析 + 净化重放
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
@@ -187,11 +181,25 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
+		
+		// 容忍客户端可能发送的前导空行
+		for {
+			peekBytes, err := reader.Peek(1)
+			if err != nil {
+				if err != io.EOF { log.Printf("Peek error from %s: %v", c.RemoteAddr(), err) }
+				return
+			}
+			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
+				reader.ReadByte()
+				continue
+			}
+			break
+		}
 
-		// 手动读取并解析HTTP请求
+		// 使用 http.ReadRequest，因为它能正确处理Chunked等复杂的HTTP Body
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			if err != io.EOF { // EOF是正常关闭，不必报错
+			if err != io.EOF {
 				log.Printf("Handshake read error from %s: %v", c.RemoteAddr(), err)
 			}
 			return
@@ -199,9 +207,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		io.Copy(ioutil.Discard, req.Body)
 		req.Body.Close()
 
-		// 检查User-Agent
 		if strings.Contains(req.UserAgent(), expectedUA) {
-			// 匹配成功，回复101并跳出循环
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
@@ -209,21 +215,28 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 			}
 			break // 成功，退出循环
 		} else {
-			// UA不匹配，回复200 OK并继续等待
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err)
-				return 
+				return
 			}
-			continue // 继续循环等待下一个请求
+			continue
 		}
 	}
 
-	// 2. HTTP握手成功，进行SSH握手
-	// 关键：我们不再需要“净化”缓冲区，因为我们从始至终都使用同一个`reader`。
-	// `ssh.NewServerConn`将无缝地从`reader`中读取可能已缓冲的SSH数据。
-	connForSSH := &handshakeConn{Conn: c, r: reader}
+	// 2. HTTP握手成功，进行“净化-重放”
+	var preReadData []byte
+	if reader.Buffered() > 0 {
+		preReadData = make([]byte, reader.Buffered())
+		n, _ := reader.Read(preReadData)
+		preReadData = preReadData[:n]
+		log.Printf("Drained %d bytes of pre-read data from %s", n, c.RemoteAddr())
+	}
+	
+	// 创建一个复合读取器，先“重放”我们净化出来的数据，再继续从网络流读取
+	finalReader := io.MultiReader(bytes.NewReader(preReadData), reader)
+	connForSSH := &handshakeConn{Conn: c, r: finalReader}
 	
 	sshHandshakeTimeout := 15 * time.Second
 	if err := connForSSH.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
@@ -264,134 +277,60 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 }
 
 // --- Web服务器逻辑 ---
+// ... (与您之前的代码相同，此处省略以保持简洁)
 func safeSaveConfig() error {
-	globalConfig.lock.Lock()
-	defer globalConfig.lock.Unlock()
-	data, err := json.MarshalIndent(globalConfig, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
+	globalConfig.lock.Lock(); defer globalConfig.lock.Unlock()
+	data, err := json.MarshalIndent(globalConfig, "", "  "); if err != nil { return fmt.Errorf("failed to marshal config: %w", err) }
 	return ioutil.WriteFile("config.json", data, 0644)
 }
-
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if validateSession(r) {
-			next.ServeHTTP(w, r)
+		if validateSession(r) { next.ServeHTTP(w, r)
 		} else {
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
-			} else {
-				http.Redirect(w, r, "/login.html", http.StatusFound)
-			}
+			if strings.HasPrefix(r.URL.Path, "/api/") { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+			} else { http.Redirect(w, r, "/login.html", http.StatusFound) }
 		}
 	}
 }
-
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"})
-		return
-	}
-	var creds struct {
-		Username, Password string
-	}
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
-		return
-	}
-	globalConfig.lock.RLock()
-	storedPass, ok := globalConfig.AdminAccounts[creds.Username]
-	globalConfig.lock.RUnlock()
-	if !ok || creds.Password != storedPass {
-		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"})
-		return
-	}
-	cookie := createSession(creds.Username)
-	http.SetCookie(w, cookie)
-	sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
+	if r.Method != http.MethodPost { sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return }
+	var creds struct{ Username, Password string }
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }
+	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
+	if !ok || creds.Password != storedPass { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }
+	cookie := createSession(creds.Username); http.SetCookie(w, cookie); sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
 }
-
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err == nil {
-		sessionsLock.Lock()
-		delete(sessions, cookie.Value)
-		sessionsLock.Unlock()
-	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
-	http.Redirect(w, r, "/login.html", http.StatusFound)
+	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound)
 }
-
 func apiHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET":
-		var users []*OnlineUser
-		onlineUsers.Range(func(key, value interface{}) bool {
-			users = append(users, value.(*OnlineUser))
-			return true
-		})
-		json.NewEncoder(w).Encode(users)
+		var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
 	case r.URL.Path == "/api/accounts" && r.Method == "GET":
-		globalConfig.lock.RLock()
-		defer globalConfig.lock.RUnlock()
-		json.NewEncoder(w).Encode(globalConfig.Accounts)
+		globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); json.NewEncoder(w).Encode(globalConfig.Accounts)
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		var accInfo AccountInfo
-		if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil {
-			http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest)
-			return
-		}
-		globalConfig.lock.Lock()
-		globalConfig.Accounts[username] = accInfo
-		globalConfig.lock.Unlock()
-		if err := safeSaveConfig(); err != nil {
-			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
-			return
-		}
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); var accInfo AccountInfo
+		if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil { http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest); return }
+		globalConfig.lock.Lock(); globalConfig.Accounts[username] = accInfo; globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError); return }
 		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		globalConfig.lock.Lock()
-		delete(globalConfig.Accounts, username)
-		globalConfig.lock.Unlock()
-		if err := safeSaveConfig(); err != nil {
-			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
-			return
-		}
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError); return }
 		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
 	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT":
-		pathParts := strings.Split(r.URL.Path, "/")
-		username := pathParts[3]
-		var payload struct{ Enabled bool }
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest)
-			return
-		}
-		globalConfig.lock.Lock()
-		if acc, ok := globalConfig.Accounts[username]; ok {
-			acc.Enabled = payload.Enabled
-			globalConfig.Accounts[username] = acc
-		}
-		globalConfig.lock.Unlock()
-		if err := safeSaveConfig(); err != nil {
-			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
-			return
-		}
+		pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct{ Enabled bool }
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest); return }
+		globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; globalConfig.Accounts[username] = acc }; globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError); return }
 		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
 	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
-		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
-		if user, ok := onlineUsers.Load(connID); ok {
-			user.(*OnlineUser).sshConn.Close()
-			removeOnlineUser(connID)
-			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
-		} else {
-			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
-		}
-	default:
-		http.NotFound(w, r)
+		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/"); if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); removeOnlineUser(connID); sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
+		} else { sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"}) }
+	default: http.NotFound(w, r)
 	}
 }
 
