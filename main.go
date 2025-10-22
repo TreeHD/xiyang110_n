@@ -453,7 +453,7 @@ func main() {
 
 	sshCfg := &ssh.ServerConfig{	
 		Config: ssh.Config{
-			ServerVersion: "SSH-2.0-WSTunnel_v3.0_by_xiaoguiday",
+			Version: "SSH-2.0-WSTunnel_v3.0_by_xiaoguiday",
 		},
 		
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
