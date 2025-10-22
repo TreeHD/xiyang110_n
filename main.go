@@ -3,7 +3,7 @@ package main
 
 import (
 	"bufio"
-	"bytes" // <--- 确保 bytes 包被引入
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -23,7 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 (无变动) ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -60,7 +60,7 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// --- handshakeConn 定义 ---
+// handshakeConn 定义
 type handshakeConn struct {
 	net.Conn
 	r io.Reader
@@ -69,7 +69,7 @@ func (hc *handshakeConn) Read(p []byte) (n int, err error) {
 	return hc.r.Read(p)
 }
 
-// --- 辅助函数 ---
+// --- 辅助函数 (无变动) ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
 func createSession(username string) *http.Cookie {
@@ -167,7 +167,6 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	}
 }
 
-// handleSshConnection - 这是被验证过可以正常工作的最终版本
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
@@ -175,14 +174,12 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
-	// 1. 循环处理HTTP请求，以兼容探针和管道式请求
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
-		
-		// 容忍客户端可能发送的前导空行
+
 		for {
 			peekBytes, err := reader.Peek(1)
 			if err != nil {
@@ -212,7 +209,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			break // 成功，退出循环
+			break 
 		} else {
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
@@ -224,7 +221,11 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		}
 	}
 
-	// 2. HTTP握手成功，进行“净化-重放”
+	// --- 关键修正：在此处加入延迟 ---
+	log.Printf("HTTP handshake successful for %s. Delaying for 500ms before starting SSH.", c.RemoteAddr())
+	time.Sleep(500 * time.Millisecond)
+	// --- 修正结束 ---
+
 	var preReadData []byte
 	if reader.Buffered() > 0 {
 		preReadData = make([]byte, reader.Buffered())
@@ -233,7 +234,6 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		log.Printf("Drained %d bytes of pre-read data from %s", n, c.RemoteAddr())
 	}
 	
-	// 创建一个复合读取器，先“重放”我们净化出来的数据，再继续从网络流读取
 	finalReader := io.MultiReader(bytes.NewReader(preReadData), reader)
 	connForSSH := &handshakeConn{Conn: c, r: finalReader}
 	
@@ -256,7 +256,6 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	}
 	defer sshConn.Close()
 	
-	// 3. 后续逻辑不变
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
 	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
