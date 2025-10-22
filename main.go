@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.orgorg/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
 )
 
 // --- 结构体及全局变量 (无变动) ---
