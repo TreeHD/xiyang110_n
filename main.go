@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	// "bytes" // <--- 删除了这一行
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -22,7 +23,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 (无变动) ---
+// --- 结构体及全局变量 ---
 type AccountInfo struct {
 	Password   string `json:"password"`
 	Enabled    bool   `json:"enabled"`
@@ -59,9 +60,20 @@ type Session struct {
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 
-// --- 辅助函数 (无变动) ---
+// handshakeConn 是一个包装器，用于安全地将 bufio.Reader 传递给 ssh.NewServerConn
+type handshakeConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (hc *handshakeConn) Read(p []byte) (n int, err error) {
+	return hc.r.Read(p)
+}
+
+// --- 辅助函数 ---
 func addOnlineUser(user *OnlineUser) { onlineUsers.Store(user.ConnID, user) }
 func removeOnlineUser(connID string) { onlineUsers.Delete(connID) }
+
 func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32)
 	rand.Read(sessionTokenBytes)
@@ -72,6 +84,7 @@ func createSession(username string) *http.Cookie {
 	sessionsLock.Unlock()
 	return &http.Cookie{Name: sessionCookieName, Value: sessionToken, Expires: expiry, Path: "/", HttpOnly: true}
 }
+
 func validateSession(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil { return false }
@@ -88,6 +101,7 @@ func validateSession(r *http.Request) bool {
 	}
 	return true
 }
+
 func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, _ := json.Marshal(payload)
 	w.Header().Set("Content-Type", "application/json")
@@ -106,7 +120,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	} else {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
-
+	
 	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s: %v", destAddr, err)
@@ -139,7 +153,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	wg.Wait()
 }
 
-// --- SSH & HTTP 握手与连接管理 (重大架构修改) ---
+// --- SSH & HTTP 握手与连接管理 ---
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -147,44 +161,80 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			_, _, err := sshConn.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil { log.Printf("Keepalive to %s failed: %v.", sshConn.RemoteAddr(), err); return }
+			if err != nil {
+				log.Printf("Keepalive to %s failed: %v.", sshConn.RemoteAddr(), err)
+				return
+			}
 		case <-done:
+			log.Printf("Keepalive for %s stopped.", sshConn.RemoteAddr())
 			return
 		}
 	}
 }
 
-// “前台接待员”：处理公网连接，只负责HTTP握手和流量转发
-func handlePublicConnection(c net.Conn) {
+func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
 
-	// 1. 使用稳定版的循环HTTP握手逻辑
+	// 1. 手动解析HTTP请求，以获得对数据流的完全控制
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
-		
-		req, err := http.ReadRequest(reader)
+
+		// 容忍客户端在HTTP请求前发送空行
+		for {
+			peekBytes, err := reader.Peek(1)
+			if err != nil {
+				if err != io.EOF { log.Printf("Peek error from %s: %v", c.RemoteAddr(), err) }
+				return
+			}
+			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
+				reader.ReadByte()
+				continue
+			}
+			break
+		}
+
+		requestLine, err := reader.ReadString('\n')
 		if err != nil {
-			if err != io.EOF { log.Printf("Handshake read error from %s: %v", c.RemoteAddr(), err) }
+			log.Printf("Failed to read request line from %s: %v", c.RemoteAddr(), err)
 			return
 		}
-		io.Copy(ioutil.Discard, req.Body); req.Body.Close()
 
-		if strings.Contains(req.UserAgent(), expectedUA) {
+		// 循环读取Header，直到找到User-Agent或遇到空行
+		uaFound := false
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				log.Printf("Failed to read header line from %s: %v", c.RemoteAddr(), err)
+				return
+			}
+			
+			if strings.TrimSpace(line) == "" { // HTTP Header结束标志
+				break
+			}
+			
+			if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
+				if strings.Contains(line, expectedUA) {
+					uaFound = true
+				}
+			}
+		}
+		
+		if uaFound {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err)
 				return
 			}
-			break 
+			break
 		} else {
-			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
+			log.Printf("Incorrect UA in handshake from %s. Waiting.", c.RemoteAddr())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil {
 				log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err)
@@ -194,52 +244,33 @@ func handlePublicConnection(c net.Conn) {
 		}
 	}
 
-	// 2. 握手成功后，连接到内部的SSH服务
-	internalSshAddr := "127.0.0.1:2222" // 内部SSH服务的地址
-	targetConn, err := net.DialTimeout("tcp", internalSshAddr, 5*time.Second)
-	if err != nil {
-		log.Printf("Failed to connect to internal SSH service at %s: %v", internalSshAddr, err)
+	// 2. HTTP握手成功，进行SSH握手
+	connForSSH := &handshakeConn{Conn: c, r: reader}
+	
+	sshHandshakeTimeout := 15 * time.Second
+	if err := connForSSH.SetDeadline(time.Now().Add(sshHandshakeTimeout)); err != nil {
+		log.Printf("Failed to set SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
 		return
 	}
-	defer targetConn.Close()
 
-	// 3. 变成纯粹的“管道工”
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		defer targetConn.Close()
-		// 将可能已缓冲的数据和后续数据一同转发
-		io.Copy(targetConn, reader) 
-	}()
-	go func() {
-		defer wg.Done()
-		defer c.Close()
-		io.Copy(c, targetConn)
-	}()
-	wg.Wait()
-}
-
-
-// “后台SSH专家”：在内部端口监听，只处理纯净的SSH连接
-func handleInternalSsh(c net.Conn, sshCfg *ssh.ServerConfig) {
-	defer c.Close()
-
-	// 这里收到的连接是纯净的，可以直接进行SSH握手
-	sshConn, chans, reqs, err := ssh.NewServerConn(c, sshCfg)
+	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
 	if err != nil {
-		// 这里的错误日志对于调试内部问题很有价值
-		log.Printf("Internal SSH handshake failed for %s: %v", c.RemoteAddr(), err)
+		log.Printf("SSH handshake failed for %s: %v", c.RemoteAddr(), err)
+		return
+	}
+
+	if err := connForSSH.SetDeadline(time.Time{}); err != nil {
+		log.Printf("Failed to clear SSH handshake deadline for %s: %v", c.RemoteAddr(), err)
+		sshConn.Close()
 		return
 	}
 	defer sshConn.Close()
-
-	// 后续逻辑与您之前的handleSshConnection后半部分完全相同
+	
+	// 3. 后续逻辑不变
 	done := make(chan struct{}); defer close(done); go sendKeepAlives(sshConn, done)
-	// 注意：这里的RemoteAddr是127.0.0.1，但User()是真实的
-	connID := c.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
+	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
-	addOnlineUser(onlineUser); log.Printf("Internal SSH handshake success for user '%s'", sshConn.User()); defer removeOnlineUser(connID)
+	addOnlineUser(onlineUser); log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User()); defer removeOnlineUser(connID)
 	go ssh.DiscardRequests(reqs)
 	
 	for newChan := range chans {
@@ -254,76 +285,150 @@ func handleInternalSsh(c net.Conn, sshCfg *ssh.ServerConfig) {
 	}
 }
 
-
-// --- Web服务器逻辑 (无变动) ---
-// ... (与您之前的代码相同，此处省略以保持简洁)
+// --- Web服务器逻辑 ---
 func safeSaveConfig() error {
-	globalConfig.lock.Lock(); defer globalConfig.lock.Unlock()
-	data, err := json.MarshalIndent(globalConfig, "", "  "); if err != nil { return fmt.Errorf("failed to marshal config: %w", err) }
+	globalConfig.lock.Lock()
+	defer globalConfig.lock.Unlock()
+	data, err := json.MarshalIndent(globalConfig, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
 	return ioutil.WriteFile("config.json", data, 0644)
 }
+
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if validateSession(r) { next.ServeHTTP(w, r)
+		if validateSession(r) {
+			next.ServeHTTP(w, r)
 		} else {
-			if strings.HasPrefix(r.URL.Path, "/api/") { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
-			} else { http.Redirect(w, r, "/login.html", http.StatusFound) }
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+			} else {
+				http.Redirect(w, r, "/login.html", http.StatusFound)
+			}
 		}
 	}
 }
+
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"}); return }
-	var creds struct{ Username, Password string }
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }
-	globalConfig.lock.RLock(); storedPass, ok := globalConfig.AdminAccounts[creds.Username]; globalConfig.lock.RUnlock()
-	if !ok || creds.Password != storedPass { sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"}); return }
-	cookie := createSession(creds.Username); http.SetCookie(w, cookie); sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
+	if r.Method != http.MethodPost {
+		sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method not allowed"})
+		return
+	}
+	var creds struct {
+		Username, Password string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
+		return
+	}
+	globalConfig.lock.RLock()
+	storedPass, ok := globalConfig.AdminAccounts[creds.Username]
+	globalConfig.lock.RUnlock()
+	if !ok || creds.Password != storedPass {
+		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "用户名或密码错误"})
+		return
+	}
+	cookie := createSession(creds.Username)
+	http.SetCookie(w, cookie)
+	sendJSON(w, http.StatusOK, map[string]string{"message": "Login successful"})
 }
+
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(sessionCookieName); if err == nil { sessionsLock.Lock(); delete(sessions, cookie.Value); sessionsLock.Unlock() }
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1}); http.Redirect(w, r, "/login.html", http.StatusFound)
+	cookie, err := r.Cookie(sessionCookieName)
+	if err == nil {
+		sessionsLock.Lock()
+		delete(sessions, cookie.Value)
+		sessionsLock.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, "/login.html", http.StatusFound)
 }
+
 func apiHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET":
-		var users []*OnlineUser; onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true }); json.NewEncoder(w).Encode(users)
+		var users []*OnlineUser
+		onlineUsers.Range(func(key, value interface{}) bool {
+			users = append(users, value.(*OnlineUser))
+			return true
+		})
+		json.NewEncoder(w).Encode(users)
 	case r.URL.Path == "/api/accounts" && r.Method == "GET":
-		globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); json.NewEncoder(w).Encode(globalConfig.Accounts)
+		globalConfig.lock.RLock()
+		defer globalConfig.lock.RUnlock()
+		json.NewEncoder(w).Encode(globalConfig.Accounts)
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); var accInfo AccountInfo
-		if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil { http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest); return }
-		globalConfig.lock.Lock(); globalConfig.Accounts[username] = accInfo; globalConfig.lock.Unlock()
-		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError); return }
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		var accInfo AccountInfo
+		if err := json.NewDecoder(r.Body).Decode(&accInfo); err != nil {
+			http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest)
+			return
+		}
+		globalConfig.lock.Lock()
+		globalConfig.Accounts[username] = accInfo
+		globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil {
+			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
+			return
+		}
 		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 添加成功", username)})
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
-		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/"); globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock()
-		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError); return }
+		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
+		globalConfig.lock.Lock()
+		delete(globalConfig.Accounts, username)
+		globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil {
+			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
+			return
+		}
 		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 删除成功", username)})
 	case strings.HasSuffix(r.URL.Path, "/status") && r.Method == "PUT":
-		pathParts := strings.Split(r.URL.Path, "/"); username := pathParts[3]; var payload struct{ Enabled bool }
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest); return }
-		globalConfig.lock.Lock(); if acc, ok := globalConfig.Accounts[username]; ok { acc.Enabled = payload.Enabled; globalConfig.Accounts[username] = acc }; globalConfig.lock.Unlock()
-		if err := safeSaveConfig(); err != nil { http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError); return }
+		pathParts := strings.Split(r.URL.Path, "/")
+		username := pathParts[3]
+		var payload struct{ Enabled bool }
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, `{"message":"无效请求体"}`, http.StatusBadRequest)
+			return
+		}
+		globalConfig.lock.Lock()
+		if acc, ok := globalConfig.Accounts[username]; ok {
+			acc.Enabled = payload.Enabled
+			globalConfig.Accounts[username] = acc
+		}
+		globalConfig.lock.Unlock()
+		if err := safeSaveConfig(); err != nil {
+			http.Error(w, `{"message":"保存配置失败"}`, http.StatusInternalServerError)
+			return
+		}
 		sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账户 %s 状态更新成功", username)})
 	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
-		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/"); if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); removeOnlineUser(connID); sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
-		} else { sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"}) }
-	default: http.NotFound(w, r)
+		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
+		if user, ok := onlineUsers.Load(connID); ok {
+			user.(*OnlineUser).sshConn.Close()
+			removeOnlineUser(connID)
+			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
+		} else {
+			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
+		}
+	default:
+		http.NotFound(w, r)
 	}
 }
-
 
 // --- main ---
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	configFile, err := os.ReadFile("config.json")
-	if err != nil { log.Fatalf("FATAL: 无法读取 config.json: %v", err) }
-	
+	if err != nil {
+		log.Fatalf("FATAL: 无法读取 config.json: %v", err)
+	}
 	globalConfig = &Config{}
 	err = json.Unmarshal(configFile, globalConfig)
-	if err != nil { log.Fatalf("FATAL: 解析 config.json 失败: %v", err) }
-	
+	if err != nil {
+		log.Fatalf("FATAL: 解析 config.json 失败: %v", err)
+	}
 	if globalConfig.ListenAddr == "" || len(globalConfig.AdminAccounts) == 0 {
 		log.Fatalf("FATAL: config.json 缺少 listen_addr 或 admin_accounts")
 	}
@@ -339,48 +444,63 @@ func main() {
 		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 
 	go func() {
-		// ... web admin panel logic ...
-		mux := http.NewServeMux(); mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") }); mux.HandleFunc("/login", loginHandler); mux.HandleFunc("/logout", authMiddleware(logoutHandler)); mux.HandleFunc("/api/", authMiddleware(apiHandler)); adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }; mux.HandleFunc("/admin.html", authMiddleware(adminHandler)); mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) } }); log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr); if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil { log.Fatalf("FATAL: 无法启动Admin panel: %v", err) }
+		mux := http.NewServeMux()
+		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
+		mux.HandleFunc("/login", loginHandler)
+		mux.HandleFunc("/logout", authMiddleware(logoutHandler))
+		mux.HandleFunc("/api/", authMiddleware(apiHandler))
+		adminHandler := func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "admin.html") }
+		mux.HandleFunc("/admin.html", authMiddleware(adminHandler))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" { http.NotFound(w, r); return }
+			if validateSession(r) { http.Redirect(w, r, "/admin.html", http.StatusFound) } else { http.Redirect(w, r, "/login.html", http.StatusFound) }
+		})
+		log.Printf("Admin panel listening on http://%s", globalConfig.AdminAddr)
+		if err := http.ListenAndServe(globalConfig.AdminAddr, mux); err != nil {
+			log.Fatalf("FATAL: 无法启动Admin panel: %v", err)
+		}
 	}()
 
 	sshCfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
-			globalConfig.lock.RLock(); accountInfo, userExists := globalConfig.Accounts[c.User()]; globalConfig.lock.RUnlock()
-			if !userExists { return nil, fmt.Errorf("user not found") }
-			if !accountInfo.Enabled { return nil, fmt.Errorf("user disabled") }
-			if accountInfo.ExpiryDate != "" { expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate); if err != nil || time.Now().After(expiry.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") } }
-			if string(p) == accountInfo.Password { log.Printf("Auth successful for user: '%s'", c.User()); return nil, nil }
-			log.Printf("Auth failed for user: '%s'", c.User()); return nil, fmt.Errorf("invalid credentials")
+			globalConfig.lock.RLock()
+			accountInfo, userExists := globalConfig.Accounts[c.User()]
+			globalConfig.lock.RUnlock()
+			if !userExists {
+				return nil, fmt.Errorf("user not found")
+			}
+			if !accountInfo.Enabled {
+				return nil, fmt.Errorf("user disabled")
+			}
+			if accountInfo.ExpiryDate != "" {
+				expiry, err := time.Parse("2006-01-02", accountInfo.ExpiryDate)
+				if err != nil || time.Now().After(expiry.Add(24*time.Hour)) {
+					return nil, fmt.Errorf("user expired")
+				}
+			}
+			if string(p) == accountInfo.Password {
+				log.Printf("Auth successful for user: '%s'", c.User())
+				return nil, nil
+			}
+			log.Printf("Auth failed for user: '%s'", c.User())
+			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
-	_, priv, err := ed25519.GenerateKey(rand.Reader); if err != nil { log.Fatalf("generate host key fail: %v", err) }
-	privateKey, err := ssh.NewSignerFromKey(priv); if err != nil { log.Fatalf("create signer fail: %v", err) }
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatalf("generate host key fail: %v", err)
+	}
+	privateKey, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		log.Fatalf("create signer fail: %v", err)
+	}
 	sshCfg.AddHostKey(privateKey)
 
-	// --- 架构修改：启动内部的SSH服务 ---
-	go func() {
-		internalAddr := "127.0.0.1:2222"
-		l, err := net.Listen("tcp", internalAddr)
-		if err != nil {
-			log.Fatalf("FATAL: Failed to listen on internal address %s: %v", internalAddr, err)
-		}
-		log.Printf("Internal SSH server listening on %s", internalAddr)
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				log.Printf("Internal accept error: %v", err)
-				continue
-			}
-			go handleInternalSsh(conn, sshCfg)
-		}
-	}()
-
-	// 启动公网的“前台接待员”服务
 	l, err := net.Listen("tcp", globalConfig.ListenAddr)
 	if err != nil {
 		log.Fatalf("listen fail: %v", err)
 	}
-	log.Printf("Public listener running on %s. All connections will be forwarded internally.", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s. All traffic will be forwarded via TCP.", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -398,8 +518,7 @@ func main() {
 					log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
 				}
 			}()
-			// 所有公网连接都由“前台接待员”处理
-			handlePublicConnection(c)
+			handleSshConnection(c, sshCfg)
 		}(conn)
 	}
 }
