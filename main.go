@@ -113,7 +113,7 @@ func sendJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-// --- 核心数据转发逻辑 (已修改为容错模式) ---
+// --- 核心数据转发逻辑 (已修正编译错误) ---
 
 // tolerantCopy 是一个带有重试逻辑的io.Copy替代品，用于应对网络波动。
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr) {
@@ -165,6 +165,7 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 	}
 }
 
+// handleDirectTCPIP 已修正，可以正确处理半关闭
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr) {
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
@@ -182,6 +183,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 		ch.Close()
 		return
 	}
+	// 在函数退出时，确保连接最终被完全关闭
 	defer destConn.Close()
 
 	if tcpConn, ok := destConn.(*net.TCPConn); ok {
@@ -193,22 +195,28 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// goroutine 1: 从SSH客户端读取数据，写入到目标服务器
 	go func() {
 		defer wg.Done()
-		defer ch.CloseWrite()
-		defer destConn.Close()
+		// 当这个方向的拷贝结束后，关闭目标连接的写方向，
+		// 这会让另一侧的Read操作收到EOF。
+		if tcpConn, ok := destConn.(*net.TCPConn); ok {
+			defer tcpConn.CloseWrite()
+		}
 		tolerantCopy(destConn, ch, "Client->Target", remoteAddr)
 	}()
 
+	// goroutine 2: 从目标服务器读取数据，写入到SSH客户端
 	go func() {
 		defer wg.Done()
-		defer ch.Close()
-		defer destConn.CloseRead()
+		// 当这个方向的拷贝结束后，关闭SSH channel的写方向。
+		defer ch.CloseWrite()
 		tolerantCopy(ch, destConn, "Target->Client", remoteAddr)
 	}()
 
 	wg.Wait()
 }
+
 
 // --- SSH & HTTP 握手与连接管理 ---
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
@@ -548,10 +556,6 @@ func main() {
 	if globalConfig.BufferSizeKB <= 0 {
 		globalConfig.BufferSizeKB = 128
 	}
-	// IdleTimeoutSeconds 默认值为0 (禁用)，除非在config.json中配置
-	// if globalConfig.IdleTimeoutSeconds <= 0 {
-	// 	globalConfig.IdleTimeoutSeconds = 90
-	// }
 
 	log.Println("====== WSTUNNEL (Pure TCP Proxy Mode) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
