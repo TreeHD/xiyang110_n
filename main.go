@@ -338,7 +338,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	done := make(chan struct{})
 	defer close(done)
 	go sendKeepAlives(sshConn, done)
-	connID := sshConn.RemoteAddr().String() + "-" + hex.AndEncodeToString(sshConn.SessionID())
+	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
 	addOnlineUser(onlineUser)
 	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
