@@ -225,14 +225,30 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 }
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
+
+	// [修复] 从配置中获取总的握手超时时长
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
+	
+	// [修复] 记录整个握手过程的开始时间，用于设置一个绝对的超时
+	handshakeStartTime := time.Now()
+
 	expectedUA := globalConfig.ConnectUA
 	reader := bufio.NewReader(c)
+
 	for {
+		// [修复] 检查是否超过了绝对的超时时间
+		if time.Since(handshakeStartTime) > timeoutDuration {
+			log.Printf("Absolute handshake timeout for %s after %v", c.RemoteAddr(), timeoutDuration)
+			return // 超过总时长，直接返回并关闭连接
+		}
+
+		// [保留] 为本次读取操作设置一个相对的空闲超时
+		// 这可以防止客户端连接后什么都不发，导致I/O一直阻塞
 		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
 			log.Printf("Failed to set read deadline for %s: %v", c.RemoteAddr(), err)
 			return
 		}
+
 		for {
 			peekBytes, err := reader.Peek(1)
 			if err != nil {
@@ -255,14 +271,16 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 		if strings.Contains(req.UserAgent(), expectedUA) {
 			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
 			if err != nil { log.Printf("Write 101 response fail for %s: %v", c.RemoteAddr(), err); return }
-			break
+			break // 握手成功，跳出循环
 		} else {
 			log.Printf("Incorrect handshake payload from %s (UA: %s). Waiting.", c.RemoteAddr(), req.UserAgent())
 			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			if err != nil { log.Printf("Write fake 200 OK response fail for %s: %v", c.RemoteAddr(), err); return }
-			continue
+			continue // 握手失败，继续循环等待，但会受到顶部的绝对超时检查的限制
 		}
 	}
+
+	// 从这里开始是握手成功后的逻辑，和之前保持一致
 	log.Printf("HTTP handshake successful for %s. Delaying for 500ms before starting SSH.", c.RemoteAddr())
 	time.Sleep(500 * time.Millisecond)
 	var preReadData []byte
@@ -320,7 +338,7 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	done := make(chan struct{})
 	defer close(done)
 	go sendKeepAlives(sshConn, done)
-	connID := sshConn.RemoteAddr().String() + "-" + hex.EncodeToString(sshConn.SessionID())
+	connID := sshConn.RemoteAddr().String() + "-" + hex.AndEncodeToString(sshConn.SessionID())
 	onlineUser := &OnlineUser{ConnID: connID, Username: sshConn.User(), RemoteAddr: sshConn.RemoteAddr().String(), ConnectTime: time.Now(), sshConn: sshConn}
 	addOnlineUser(onlineUser)
 	log.Printf("SSH handshake success from %s for user '%s'", sshConn.RemoteAddr(), sshConn.User())
