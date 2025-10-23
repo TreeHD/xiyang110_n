@@ -113,6 +113,36 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	atomic.AddInt64(&activeConn, 1)
 	defer atomic.AddInt64(&activeConn, -1)
 
+	// ======================================================================
+	// --- 模式一：为 UdpGw 提供一个简单的、持久的管道 ---
+	// ======================================================================
+	if destPort == 7300 {
+		log.Printf("Detected UDP relay request on port 7300 from %s. Using persistent pipe for udpgw.", remoteAddr)
+		
+		destConn, err := net.Dial("tcp", "127.0.0.1:7300")
+		if err != nil {
+			log.Printf("UDP Relay: Failed to connect to local udpgw (127.0.0.1:7300): %v", err)
+			ch.Close()
+			return
+		}
+		defer destConn.Close()
+		defer ch.Close()
+
+		// 使用最简单的双向 io.Copy，不使用 WaitGroup 或 CloseWrite。
+		// 这创建了一个“永不主动关闭”的管道，直到一端（客户端或udpgw）断开连接。
+		// 这正是 udpgw 所期望的行为。
+		go func() {
+			// 在独立的 goroutine 中关闭，防止阻塞主拷贝流程
+			defer destConn.Close()
+			io.Copy(destConn, ch)
+		}()
+		io.Copy(ch, destConn)
+		return
+	}
+
+	// ======================================================================
+	// --- 模式二：为普通TCP流量提供健壮的、带半双工关闭的转发 ---
+	// ======================================================================
 	var destAddr string
 	if strings.Contains(destHost, ":") {
 		destAddr = fmt.Sprintf("[%s]:%d", destHost, destPort)
@@ -126,8 +156,10 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 		ch.Close()
 		return
 	}
-	defer destConn.Close()
 	
+	defer destConn.Close()
+	defer ch.Close()
+
 	if tcpConn, ok := destConn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
@@ -137,63 +169,23 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 自定义带超时的转发函数
-	copyWithTimeout := func(dst io.Writer, src io.Reader, timeout time.Duration) {
+	// Goroutine 1: 下载 (目标 -> 客户端)
+	go func() {
 		defer wg.Done()
-		
-		if sc, ok := dst.(ssh.Channel); ok {
-			defer sc.CloseWrite()
-		} else if tc, ok := dst.(net.Conn); ok {
-			if tcpConn, ok := tc.(*net.TCPConn); ok {
-				defer tcpConn.CloseWrite()
-			} else {
-				defer tc.Close()
-			}
-		}
-
-		// [最终修正] 使用配置文件中的缓冲区大小
-		// 如果BufferSizeKB小于1，则使用一个默认值防止恐慌
-		bufferSize := globalConfig.BufferSizeKB
-		if bufferSize <= 0 {
-			bufferSize = 32 // 默认32KB
-		}
-		buf := make([]byte, bufferSize*1024)
-
-		for {
-			if rc, ok := src.(net.Conn); ok {
-				rc.SetReadDeadline(time.Now().Add(timeout))
-			} else if rc, ok := src.(ssh.Channel); ok {
-				rc.(net.Conn).SetReadDeadline(time.Now().Add(timeout))
-			}
-
-			n, err := src.Read(buf)
-			if n > 0 {
-				if wc, ok := dst.(net.Conn); ok {
-					wc.SetWriteDeadline(time.Now().Add(timeout))
-				} else if wc, ok := dst.(ssh.Channel); ok {
-					wc.(net.Conn).SetWriteDeadline(time.Now().Add(timeout))
-				}
-				
-				if _, werr := dst.Write(buf[:n]); werr != nil {
-					break
-				}
-			}
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				break
-			}
-		}
-	}
-
-	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
-
-	// 上传: 客户端 -> 目标
-	go copyWithTimeout(destConn, ch, idleTimeout)
+		defer ch.CloseWrite() 
+		io.Copy(ch, destConn)
+	}()
 	
-	// 下载: 目标 -> 客户端
-	go copyWithTimeout(ch, destConn, idleTimeout)
+	// Goroutine 2: 上传 (客户端 -> 目标)
+	go func() {
+		defer wg.Done()
+		if tcpConn, ok := destConn.(*net.TCPConn); ok {
+			defer tcpConn.CloseWrite()
+		} else {
+			defer destConn.Close()
+		}
+		io.Copy(destConn, ch)
+	}()
 
 	wg.Wait()
 }
@@ -217,7 +209,12 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 }
 
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
-	defer c.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
+		}
+		c.Close()
+	}()
 	
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
 	expectedUA := globalConfig.ConnectUA
@@ -326,10 +323,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/api/online-users" && r.Method == "GET":
 		var users []*OnlineUser
-		onlineUsers.Range(func(key, value interface{}) bool {
-			users = append(users, value.(*OnlineUser))
-			return true
-		})
+		onlineUsers.Range(func(key, value interface{}) bool { users = append(users, value.(*OnlineUser)); return true })
 		json.NewEncoder(w).Encode(users)
 	case r.URL.Path == "/api/accounts" && r.Method == "GET":
 		globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock()
@@ -363,6 +357,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+
 // --- main ---
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -373,12 +368,12 @@ func main() {
 	if globalConfig.ListenAddr == "" { log.Fatalf("FATAL: config.json 缺少 listen_addr") }
 
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
-	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 1 } // 更短的握手超时
+	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 5 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "26.4.0" }
-	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 32 } // 默认一个较小值
+	if globalConfig.BufferSizeKB <= 0 { globalConfig.BufferSizeKB = 8 } // 默认一个小的缓冲区
 	if globalConfig.IdleTimeoutSeconds <= 0 { globalConfig.IdleTimeoutSeconds = 120 }
 
-	log.Println("====== WSTUNNEL (Robust TCP Proxy Mode) Starting ======")
+	log.Println("====== WSTUNNEL (TCP Proxy + UDP Relay via UdpGw) Starting ======")
 	log.Printf("Config: HandshakeTimeout=%ds, ConnectUA='%s', BufferSize=%dKB, IdleTimeout=%ds",
 		globalConfig.HandshakeTimeout, globalConfig.ConnectUA, globalConfig.BufferSizeKB, globalConfig.IdleTimeoutSeconds)
 
@@ -419,7 +414,7 @@ func main() {
 	sshCfg.AddHostKey(privateKey)
 
 	l, err := net.Listen("tcp", globalConfig.ListenAddr); if err != nil { log.Fatalf("listen fail: %v", err) }
-	log.Printf("SSH server listening on %s. All traffic will be forwarded via TCP.", globalConfig.ListenAddr)
+	log.Printf("SSH server listening on %s. All traffic will be forwarded.", globalConfig.ListenAddr)
 	for {
 		conn, err := l.Accept(); if err != nil { log.Printf("Accept failed: %v", err); continue }
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
