@@ -67,7 +67,11 @@ type OnlineUser struct {
 var onlineUsers sync.Map
 var userConnectionCount sync.Map
 
-type TrafficInfo struct{ Sent, Received uint64 }
+// [BUG 1 已修复] 添加了 json 标签，以便前端能正确解析
+type TrafficInfo struct {
+	Sent     uint64 `json:"sent"`
+	Received uint64 `json:"received"`
+}
 
 var globalTraffic sync.Map
 
@@ -77,6 +81,7 @@ type LogCollector struct {
 	maxCap int
 }
 
+// [BUG 3 已修复] 修正 Write 方法的返回值，确保 log 包能持续工作
 func (lc *LogCollector) Write(p []byte) (n int, err error) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
@@ -85,7 +90,10 @@ func (lc *LogCollector) Write(p []byte) (n int, err error) {
 	if len(lc.logs) > lc.maxCap {
 		lc.logs = lc.logs[len(lc.logs)-lc.maxCap:]
 	}
-	return os.Stderr.Write([]byte(logLine))
+	// 仍然在控制台打印日志，以便调试
+	fmt.Fprint(os.Stderr, logLine)
+	// 关键修复：向 log 包返回原始消息的长度和 nil 错误
+	return len(p), nil
 }
 func (lc *LogCollector) GetLogs() []string {
 	lc.mu.RLock()
@@ -159,16 +167,12 @@ type handshakeConn struct {
 }
 
 func (hc *handshakeConn) Read(p []byte) (n int, err error) { return hc.r.Read(p) }
-// 请用这个函数，完整替换掉您 main.go 文件中的 tolerantCopy 函数
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr, username string) {
-	// [优化保留] 从池中获取缓冲区
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
 	buf := *bufPtr
-
-	// [原始逻辑恢复] 获取重试参数
 	maxRetries := globalConfig.TolerantCopyMaxRetries
-	if maxRetries <= 0 { // 提供一个默认值，防止配置错误
+	if maxRetries <= 0 {
 		maxRetries = 100
 	}
 	retryDelay := time.Duration(globalConfig.TolerantCopyRetryDelayMs) * time.Millisecond
@@ -176,23 +180,16 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 		retryDelay = 500 * time.Millisecond
 	}
 	consecutiveTempErrors := 0
-
-	// [优化保留] 获取用户的流量统计器
 	val, _ := globalTraffic.LoadOrStore(username, &TrafficInfo{})
 	traffic := val.(*TrafficInfo)
-
 	for {
 		nr, rErr := src.Read(buf)
 		if nr > 0 {
-			// [原始逻辑恢复] 如果之前有错误，现在成功了，就打印一条恢复日志
 			if consecutiveTempErrors > 0 {
 				globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Network recovery for %s after %d failed attempts.\n", direction, remoteAddr, consecutiveTempErrors)))
 			}
-			consecutiveTempErrors = 0 // 只要有一次成功，就重置计数器
-
+			consecutiveTempErrors = 0
 			nw, wErr := dst.Write(buf[0:nr])
-			
-			// [优化保留] 在成功写入后，统计流量
 			if nw > 0 {
 				if direction == "Client->Target" {
 					atomic.AddUint64(&traffic.Sent, uint64(nw))
@@ -200,7 +197,6 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 					atomic.AddUint64(&traffic.Received, uint64(nw))
 				}
 			}
-
 			if wErr != nil {
 				if wErr != io.EOF {
 					globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Permanent write error for %s: %v\n", direction, remoteAddr, wErr)))
@@ -212,13 +208,10 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 				break
 			}
 		}
-
 		if rErr != nil {
 			if rErr == io.EOF {
-				break // 正常结束
+				break
 			}
-			
-			// [原始逻辑恢复] 完整的临时错误处理和重试机制
 			if netErr, ok := rErr.(net.Error); ok && (netErr.Timeout() || netErr.Temporary()) {
 				consecutiveTempErrors++
 				if consecutiveTempErrors > maxRetries {
@@ -229,15 +222,22 @@ func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net
 				time.Sleep(retryDelay)
 				continue
 			}
-			
 			globalLog.Write([]byte(fmt.Sprintf("TCP Proxy (%s): Unrecoverable read error for %s: %v\n", direction, remoteAddr, rErr)))
 			break
 		}
 	}
 }
+
+// [硬编码已修复] 使用配置文件中的超时设置
 func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteAddr net.Addr, username string) {
 	destAddr := fmt.Sprintf("%s:%d", destHost, destPort)
-	destConn, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
+	// 从全局配置中读取超时时间
+	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		// 如果配置值无效，提供一个安全的默认值
+		timeout = 10 * time.Second
+	}
+	destConn, err := net.DialTimeout("tcp", destAddr, timeout)
 	if err != nil {
 		ch.Close()
 		return
@@ -274,8 +274,6 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		}
 	}
 }
-
-// 已恢复您原始的、兼容性更好的握手逻辑
 func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	defer c.Close()
 	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
@@ -500,31 +498,58 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			user.(*OnlineUser).sshConn.Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
 		}
+	// [BUG 2 已修复] 替换为更健壮、更正确的逻辑
 	case r.URL.Path == "/api/accounts/set_status" && r.Method == "POST":
 		var payload struct {
 			Username string `json:"username"`
 			Enabled  bool   `json:"enabled"`
 		}
-		if json.NewDecoder(r.Body).Decode(&payload) != nil {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
 			return
 		}
+
+		var connsToClose []ssh.Conn
+
 		globalConfig.lock.Lock()
-		if acc, ok := globalConfig.Accounts[payload.Username]; ok {
-			acc.Enabled = payload.Enabled
-			globalConfig.Accounts[payload.Username] = acc
-			if !payload.Enabled {
-				onlineUsers.Range(func(_, v interface{}) bool {
-					u := v.(*OnlineUser)
-					if u.Username == payload.Username {
-						u.sshConn.Close()
-					}
-					return true
-				})
-			}
+		// 1. 从 map 中获取账户信息的副本
+		acc, ok := globalConfig.Accounts[payload.Username]
+		if !ok {
+			// 作为代码健壮性保障，处理用户不存在的情况
+			globalConfig.lock.Unlock()
+			sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：尝试操作一个不存在的用户"})
+			return
 		}
-		globalConfig.lock.Unlock()
-		safeSaveConfig()
+
+		// 2. 修改副本的状态
+		acc.Enabled = payload.Enabled
+
+		// 3. [核心修复] 将修改后的完整副本重新存回 map，覆盖旧的数据
+		globalConfig.Accounts[payload.Username] = acc
+
+		// 如果是禁用账户，则收集该用户的所有在线连接，准备断开
+		if !payload.Enabled {
+			onlineUsers.Range(func(_, v interface{}) bool {
+				u := v.(*OnlineUser)
+				if u.Username == payload.Username {
+					connsToClose = append(connsToClose, u.sshConn)
+				}
+				return true
+			})
+		}
+		globalConfig.lock.Unlock() // 尽快释放锁
+
+		// 4. 在锁外部执行网络操作和文件操作
+		for _, conn := range connsToClose {
+			conn.Close()
+		}
+
+		if err := safeSaveConfig(); err != nil {
+			log.Printf("ERROR: Failed to save config after updating user status: %v", err)
+			sendJSON(w, http.StatusOK, map[string]string{"message": "状态更新成功（但保存到文件失败）"})
+			return
+		}
+
 		sendJSON(w, http.StatusOK, map[string]string{"message": "状态更新成功"})
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
 		var payload struct {
@@ -634,6 +659,9 @@ func main() {
 	}
 	if globalConfig.IdleTimeoutSeconds <= 0 {
 		globalConfig.IdleTimeoutSeconds = 120
+	}
+	if globalConfig.TargetConnectTimeoutSeconds <= 0 { // 添加对新配置的默认值检查
+		globalConfig.TargetConnectTimeoutSeconds = 10
 	}
 	bufferPool = sync.Pool{New: func() interface{} {
 		buf := make([]byte, globalConfig.BufferSizeKB*1024)
