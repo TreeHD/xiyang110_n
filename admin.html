@@ -5,64 +5,317 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WSTunnel Admin</title>
     <style>
-        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:#f4f7fb;margin:0;font-size:15px} .container{max-width:1400px;margin:0 auto;padding:0 18px} .card{background:white;border-radius:8px;padding:18px;box-shadow:0 4px 14px rgba(20,30,60,0.06)} .page-grid > .card, .right-panel-wrapper > .card { margin-top: 12px; } table{width:100%;border-collapse:collapse;font-size:14px;} th,td{padding:10px 12px;border-bottom:1px solid #f1f5f9;word-wrap:break-word; text-align: center; vertical-align: middle;} #device-list td { white-space: nowrap; } th{white-space:nowrap}thead th{position:sticky;top:0;background:#f8fafc;border-bottom:2px solid #eef2f7;font-weight:700} tr:last-child td {border-bottom: none;} td:first-child, th:first-child { text-align: left; } td:nth-child(2) { text-align: left; } td:last-child, th:last-child { text-align: center; } .table-container,.device-list-container{overflow-x:auto;border-radius:8px;border:1px solid #e6eef8;margin-top:8px}.table-container{max-height:calc(100vh - 280px)}.device-list-container{flex-grow: 1;}.btn{border:0;padding:8px 12px;border-radius:6px;cursor:pointer;font-weight:700;color:white;transition:opacity .2s}.btn:hover{opacity:0.85}.btn-sm{padding:5px 8px; font-size:12px;}.btn.primary{background:#2563eb}.btn.secondary{background:#10b981}.btn.danger{background:#dc2626}.btn.info{background:#0ea5e9}.btn.warning{background:#f59e0b}.status-pill{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;font-size:12px} .status-normal, .status-活跃 {background:#e6ffed;color:#065f46} .status-banned {background:#fecaca;color:#991b1b} .status-expired {background:#feecdc;color:#9a3412} .navbar{display:flex;gap:8px;align-items:center;padding:8px 0;flex-wrap:wrap;border-bottom: 1px solid #e2e8f0;}.navbar a{padding:8px 12px;border-radius:8px;text-decoration:none;font-weight:700;color:#0f172a;transition:background-color .2s, color .2s}.navbar a.active{background:#eef2ff; color:#2563eb;}.navbar a:not(.active):hover{background-color:#f8fafc;}.form-row{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}.form-row label{font-weight:600} input[type="text"],input[type="password"],input[type="number"],input[type="date"],select,textarea{font-size:14px;padding:8px;border:1px solid #e2e8f0;border-radius:6px;box-sizing:border-box} input[type="text"],input[type="password"],input[type="number"],input[type="date"],select{height:32px; padding: 4px 8px;} .status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:12px 0}.status-card{background:#fff;border-radius:8px;padding:12px 16px;box-shadow:0 4px 12px rgba(20,30,60,0.05);border:1px solid #eef2f7;display:flex;flex-direction:column;gap:4px}.status-card span{font-size:14px;color:#64748b}.status-card strong{font-size:16px;color:#0f172a;font-weight:600} .settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;margin-top:12px}.settings-group{border:1px solid #eef2f7;border-radius:8px;padding:12px 16px}.settings-group h3{margin-top:0;font-size:16px;border-bottom:1px solid #eef2f7;padding-bottom:10px;margin-bottom:16px}.settings-group .form-row{margin-top:12px}.settings-group .form-row label{min-width:140px;text-align:right;font-weight:normal;color:#334155}.settings-group .form-row input{flex-grow:1;} .toggle-switch{position:relative;display:inline-block;width:50px;height:28px}.toggle-switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:28px}.slider:before{position:absolute;content:"";height:20px;width:20px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%}input:checked+.slider{background-color:#2563eb}input:checked+.slider:before{transform:translateX(22px)} .page-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(450px, 1fr); gap: 12px; align-items: stretch; } .page-grid > .card, .right-panel-wrapper > .card { display: flex; flex-direction: column; height: calc(100vh - 200px); min-width: 0; } .form-panel .form-row { flex-wrap: nowrap; }.form-panel .form-row label { flex-basis: 120px; flex-shrink: 0; text-align: right; font-weight: normal; color: #334155; line-height: 32px; }.form-panel .form-row input, .form-panel .form-row select { flex-grow: 1; } .action-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; } #device-list-body tr { cursor: pointer; transition: background-color .2s; }#device-list-body tr:hover { background-color: #f8fafc; }#device-list-body tr.highlight { background-color: #eef2ff !important; } #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; } .toast { padding: 12px 18px; border-radius: 6px; color: white; font-weight: 600; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateX(100%); transition: all 0.4s ease-in-out; }.toast.show { opacity: 1; transform: translateX(0); }.toast.success { background-color: #10b981; }.toast.error { background-color: #dc2626; } .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 10000; display: flex; justify-content: center; align-items: center; opacity: 0; visibility: hidden; transition: all 0.3s; }.modal-overlay.show { opacity: 1; visibility: visible; } .modal-content { background: white; padding: 25px; border-radius: 8px; max-width: 400px; width: 90%; text-align: center; transform: scale(0.9); transition: all 0.3s; }.modal-overlay.show .modal-content { transform: scale(1); } .modal-buttons { display: flex; justify-content: center; gap: 15px; margin-top: 20px; } .right-panel-wrapper { display: flex; flex-direction: column; } .right-panel-wrapper .card { margin-top: 0; } .page-grid > .card, .right-panel-wrapper { height: calc(100vh - 200px); } .right-panel-wrapper .card:last-child { margin-top: 12px; flex-grow: 1; display: flex; flex-direction: column; } #log-viewer {height:calc(100vh - 280px);overflow:auto;background:#282c34;color:#abb2bf;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;} @media (max-width: 1024px) { .page-grid { grid-template-columns: 1fr; } .page-grid > .card, .right-panel-wrapper { height: auto; } .device-list-container, .table-container { max-height: 400px; } .form-panel .form-row, .settings-group .form-row { flex-wrap: wrap; } .form-panel .form-row label, .settings-group .form-row label { text-align: left; flex-basis: 100%; } }
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:#f4f7fb;margin:0;font-size:15px} .container{max-width:1400px;margin:0 auto;padding:0 18px} .card{background:white;border-radius:8px;padding:18px;box-shadow:0 4px 14px rgba(20,30,60,0.06)} .page-grid > .card, .right-panel-wrapper > .card { margin-top: 12px; } table{width:100%;border-collapse:collapse;font-size:14px;} th,td{padding:10px 12px;border-bottom:1px solid #f1f5f9;word-wrap:break-word; text-align: center; vertical-align: middle;} #device-list td { white-space: nowrap; } th{white-space:nowrap}thead th{position:sticky;top:0;background:#f8fafc;border-bottom:2px solid #eef2f7;font-weight:700} tr:last-child td {border-bottom: none;} td:first-child, th:first-child { text-align: left; } td:nth-child(2) { text-align: left; } td:last-child, th:last-child { text-align: center; } .table-container,.device-list-container{overflow-x:auto;border-radius:8px;border:1px solid #e6eef8;margin-top:8px}.table-container{max-height:calc(100vh - 400px)}.device-list-container{flex-grow: 1;}.btn{border:0;padding:8px 12px;border-radius:6px;cursor:pointer;font-weight:700;color:white;transition:opacity .2s}.btn:hover{opacity:0.85}.btn-sm{padding:5px 8px; font-size:12px;}.btn.primary{background:#2563eb}.btn.secondary{background:#10b981}.btn.danger{background:#dc2626}.btn.info{background:#0ea5e9}.btn.warning{background:#f59e0b}.status-pill{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;font-size:12px} .status-normal, .status-活跃 {background:#e6ffed;color:#065f46} .status-banned {background:#fecaca;color:#991b1b} .status-expired {background:#feecdc;color:#9a3412} .status-握手 {background:#fffbeb;color:#b45309} .navbar{display:flex;gap:8px;align-items:center;padding:8px 0;flex-wrap:wrap;border-bottom: 1px solid #e2e8f0;}.navbar a{padding:8px 12px;border-radius:8px;text-decoration:none;font-weight:700;color:#0f172a;transition:background-color .2s, color .2s}.navbar a.active{background:#eef2ff; color:#2563eb;}.navbar a:not(.active):hover{background-color:#f8fafc;}.form-row{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}.form-row label{font-weight:600} input[type="text"],input[type="password"],input[type="number"],input[type="date"],select,textarea{font-size:14px;padding:8px;border:1px solid #e2e8f0;border-radius:6px;box-sizing:border-box} input[type="text"],input[type="password"],input[type="number"],input[type="date"],select{height:32px; padding: 4px 8px;} textarea { width: 100%; resize: vertical; } .status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:12px 0}.status-card{background:#fff;border-radius:8px;padding:12px 16px;box-shadow:0 4px 12px rgba(20,30,60,0.05);border:1px solid #eef2f7;display:flex;flex-direction:column;gap:4px}.status-card span{font-size:14px;color:#64748b}.status-card strong{font-size:16px;color:#0f172a;font-weight:600}.status-card small{font-size:12px;color:#94a3b8} .settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px;margin-top:12px}.settings-group{border:1px solid #eef2f7;border-radius:8px;padding:12px 16px}.settings-group h3{margin-top:0;font-size:16px;border-bottom:1px solid #eef2f7;padding-bottom:10px;margin-bottom:16px}.settings-group .form-row{margin-top:12px}.settings-group .form-row label{min-width:140px;text-align:right;font-weight:normal;color:#334155}.settings-group .form-row input{flex-grow:1;} .toggle-switch{position:relative;display:inline-block;width:50px;height:28px}.toggle-switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:28px}.slider:before{position:absolute;content:"";height:20px;width:20px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%}input:checked+.slider{background-color:#2563eb}input:checked+.slider:before{transform:translateX(22px)} .page-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(450px, 1fr); gap: 12px; align-items: stretch; } .page-grid > .card, .right-panel-wrapper > .card { display: flex; flex-direction: column; height: calc(100vh - 200px); min-width: 0; } .form-panel .form-row { flex-wrap: nowrap; }.form-panel .form-row label { flex-basis: 120px; flex-shrink: 0; text-align: right; font-weight: normal; color: #334155; line-height: 32px; }.form-panel .form-row input, .form-panel .form-row select { flex-grow: 1; } .action-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; } #device-list-body tr { cursor: pointer; transition: background-color .2s; }#device-list-body tr:hover { background-color: #f8fafc; }#device-list-body tr.highlight { background-color: #eef2ff !important; } #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; } .toast { padding: 12px 18px; border-radius: 6px; color: white; font-weight: 600; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateX(100%); transition: all 0.4s ease-in-out; }.toast.show { opacity: 1; transform: translateX(0); }.toast.success { background-color: #10b981; }.toast.error { background-color: #dc2626; } .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 10000; display: flex; justify-content: center; align-items: center; opacity: 0; visibility: hidden; transition: all 0.3s; }.modal-overlay.show { opacity: 1; visibility: visible; } .modal-content { background: white; padding: 25px; border-radius: 8px; max-width: 400px; width: 90%; text-align: center; transform: scale(0.9); transition: all 0.3s; }.modal-overlay.show .modal-content { transform: scale(1); } .modal-buttons { display: flex; justify-content: center; gap: 15px; margin-top: 20px; } .right-panel-wrapper { display: flex; flex-direction: column; } .right-panel-wrapper .card { margin-top: 0; } .page-grid > .card, .right-panel-wrapper { height: calc(100vh - 200px); } .right-panel-wrapper .card:last-child { margin-top: 12px; flex-grow: 1; display: flex; flex-direction: column; } #log-viewer {height:calc(100vh - 280px);overflow:auto;background:#282c34;color:#abb2bf;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;}
+
+        @media (max-width: 1024px) {
+            .page-grid { grid-template-columns: 1fr; } 
+            .page-grid > .card, .right-panel-wrapper { height: auto; }
+            .device-list-container, .table-container { max-height: 400px; }
+            .form-panel .form-row, .settings-group .form-row { flex-wrap: wrap; }
+            .form-panel .form-row label, .settings-group .form-row label { text-align: left; flex-basis: 100%; }
+        }
     </style>
 </head>
 <body>
-<div id="toast-container"></div><div id="modal-container"></div>
+<div id="toast-container"></div>
+<div id="modal-container"></div>
 <div class="container">
-    <nav class="navbar"><a href="#/status">连接状态</a><a href="#/device">账号管理</a><a href="#/account">面板设置</a><a href="#/settings">系统设置</a><a href="#/logs">系统日志</a><a style="margin-left:auto;background:#ff6b6b;color:#fff;border-radius:6px;padding:8px 12px;text-decoration:none" href="/logout">退出</a></nav>
-    <div class="status-bar"><div class="status-card"><span>登录用户</span><strong id="current-user">...</strong></div><div class="status-card"><span>活跃连接</span><strong id="active-connections">...</strong></div><div class="status-card"><span>总上传</span><strong id="global-sent">...</strong></div><div class="status-card"><span>总下载</span><strong id="global-received">...</strong></div><div class="status-card"><span>运行时长</span><strong id="server-uptime">...</strong></div><div class="status-card"><span>CPU</span><strong id="cpu-usage">...</strong></div><div class="status-card"><span>内存使用</span><strong id="mem-usage">...</strong></div></div>
+    <nav class="navbar">
+        <a href="#/status">连接状态</a>
+        <a href="#/device">账号管理</a>
+        <a href="#/account">面板设置</a>
+        <a href="#/settings">系统设置</a>
+        <a href="#/logs">系统日志</a>
+        <a style="margin-left:auto;background:#ff6b6b;color:#fff;border-radius:6px;padding:8px 12px;text-decoration:none" href="/logout">退出</a>
+    </nav>
+    <div class="status-bar">
+        <div class="status-card"><span>登录用户</span><strong id="current-user">...</strong></div>
+        <div class="status-card"><span>活跃连接</span><strong id="active-connections">...</strong></div>
+        <div class="status-card"><span>总上传</span><strong id="global-sent">...</strong></div>
+        <div class="status-card"><span>总下载</span><strong id="global-received">...</strong></div>
+        <div class="status-card"><span>运行时长</span><strong id="server-uptime">...</strong></div>
+        <div class="status-card"><span>CPU</span><strong id="cpu-usage">...</strong></div>
+        <div class="status-card"><span>内存使用</span><strong id="mem-usage">...</strong></div>
+    </div>
     <main id="content-area"></main>
 </div>
+
 <script>
     const gid = id => document.getElementById(id);
     const contentArea = gid('content-area');
     let appState = { accounts: {}, status: {}, connections: [], settings: null, logs: [], traffic: {}, currentUser: '' };
     let refreshInterval;
+
     const formatBytes = (b, d = 2) => { if (!isFinite(b) || b <= 0) return "0 B"; const k = 1024, s = ["B", "KB", "MB", "GB", "TB"], i = Math.floor(Math.log(b) / Math.log(k)); return `${parseFloat((b / Math.pow(k, i)).toFixed(d))} ${s[i]}`; };
     const formatTime = (iso) => iso ? new Date(iso).toLocaleString() : 'N/A';
-    function showToast(message, type = 'success', duration = 3000) { const container = gid('toast-container'); const toast = document.createElement('div'); toast.className = `toast ${type}`; toast.textContent = message; container.appendChild(toast); setTimeout(() => toast.classList.add('show'), 10); setTimeout(() => { toast.classList.remove('show'); setTimeout(() => toast.remove(), 400); }, duration); }
-    function showConfirm(title, message, onConfirm) { const container = gid('modal-container'); container.innerHTML = `<div class="modal-overlay"><div class="modal-content"><h3>${title}</h3><p>${message}</p><div class="modal-buttons"><button class="btn secondary" id="modal-cancel">取消</button><button class="btn danger" id="modal-confirm">确认</button></div></div></div>`; const overlay = container.querySelector('.modal-overlay'); setTimeout(() => overlay.classList.add('show'), 10); const closeModal = () => { overlay.classList.remove('show'); setTimeout(() => container.innerHTML = '', 300); }; gid('modal-confirm').onclick = () => { onConfirm(); closeModal(); }; gid('modal-cancel').onclick = closeModal; }
-    async function apiRequest(url, options = {}) { if (options.body) options.headers = { ...options.headers, 'Content-Type': 'application/json' }; try { const response = await fetch(url, options); if (response.status === 401) { window.location.href = "/login.html"; return null; } const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.message || `HTTP error ${response.status}`); return data; } catch (error) { console.error(`API Error for ${url}:`, error); showToast(error.message, 'error'); return null; } }
-    function renderStatusPage() { contentArea.innerHTML = `<div class="card"><div style="display:flex; justify-content: space-between; align-items: center;"><h2>连接状态</h2></div><div class="table-container"><table><thead><tr><th>账号名称</th><th>状态</th><th>上传</th><th>下载</th><th>剩余流量</th><th>有效期</th><th>IP地址</th><th>连接时间</th><th>操作</th></tr></thead><tbody id="connections-body"></tbody></table></div></div>`; renderConnectionsTable(); }
-    function renderDevicePage() { contentArea.innerHTML = `<div class="page-grid"><div class="card"><h3 style="margin:0;">账号列表</h3><div class="device-list-container"><table><thead><tr><th>状态</th><th>名称</th><th>用户名 (Key)</th><th>有效期</th><th>已用/总量</th><th>连接数</th><th>操作</th></tr></thead><tbody id="device-list-body"></tbody></table></div></div><div class="right-panel-wrapper"><div class="card form-panel"><h3 id="form-title" style="margin:0;">创建账号</h3><input type="hidden" id="current_editing_key"><div class="form-row"><label>友好名称:</label><input id="friendly_name" type="text" placeholder="e.g. MyPhone"></div><div class="form-row"><label>用户名:</label><input id="username" type="text" placeholder="e.g. user01"></div><div class="form-row"><label>密码:</label><input id="password" type="text"></div><div class="form-row"><label>有效期:</label><input id="expiry_date" type="date"></div><div class="form-row"><label>流量 (GB):</label><input id="limit_gb" type="number" placeholder="0为无限"></div><div class="form-row"><label>最大连接数:</label><input id="max_sessions" type="number" value="1"></div><div class="form-row" style="align-items:center;"><label>启用账号:</label><label class="toggle-switch"><input type="checkbox" id="enabled" checked><span class="slider"></span></label></div><div class="action-buttons" style="flex-direction:column; align-items:stretch; gap:8px; margin-top:20px;"><button class="btn info" onclick="generateNewDevice()">一键填充</button><button class="btn secondary" onclick="resetTraffic()">重置流量</button><button class="btn primary" onclick="saveAccount()">保存设置</button><button class="btn" style="background:#64748b" onclick="clearForm()">清空表单</button></div></div><div class="card"><h3 style="margin-top:0;">封禁列表</h3><div class="device-list-container" style="max-height: 200px;"><table id="blacklist-table"><thead><tr><th>名称</th><th>用户名</th><th>操作</th></tr></thead><tbody></tbody></table></div></div></div></div>`; renderDevicesTable(); renderBlacklistTable(); }
-    function renderAccountPage() { contentArea.innerHTML = `<div class="card" style="max-width:500px; margin: 12px auto;"><h2>面板密码设置</h2><p style="color:#64748b; font-size:13px;">在这里修改您当前登录的管理面板账号 (${appState.currentUser}) 的密码。</p><div class="form-row" style="flex-direction:column; align-items:stretch;"><label>旧密码:</label><input id="old_pass" type="password"></div><div class="form-row" style="flex-direction:column; align-items:stretch;"><label>新密码:</label><input id="new_pass" type="password"></div><div class="form-row" style="margin-top:20px;"><button class="btn secondary" onclick="updateAdminPassword()">更新密码</button></div></div>`; }
-    function renderSettingsPage() { const s = appState.settings; if (!s) { contentArea.innerHTML = `<div class="card">正在加载设置...</div>`; return; } contentArea.innerHTML = `<div class="card"><h2>系统设置</h2><p style="font-size:13px;color:#64748b;">修改这些设置后将保存到 config.json。有些设置可能需要重启程序才能完全生效。</p><div class="settings-grid"><div class="settings-group"><h3>握手与连接</h3><div class="form-row"><label>HTTP握手超时 (秒):</label><input id="s_handshake_timeout" type="number" value="${s.handshake_timeout}"></div><div class="form-row"><label>连接 User-Agent:</label><input id="s_connect_ua" type="text" value="${s.connect_ua}"></div><div class="form-row"><label>连接空闲超时 (秒):</label><input id="s_idle_timeout_seconds" type="number" value="${s.idle_timeout_seconds}"></div><div class="form-row"><label>目标连接超时 (秒):</label><input id="s_target_connect_timeout_seconds" type="number" value="${s.target_connect_timeout_seconds}"></div></div><div class="settings-group"><h3>性能与转发</h3><div class="form-row"><label>缓冲区大小 (KB):</label><input id="s_buffer_size_kb" type="number" value="${s.buffer_size_kb}"></div><div class="form-row"><label>网络错误重试次数:</label><input id="s_tolerant_copy_max_retries" type="number" value="${s.tolerant_copy_max_retries}"></div><div class="form-row"><label>错误重试延迟 (毫秒):</label><input id="s_tolerant_copy_retry_delay_ms" type="number" value="${s.tolerant_copy_retry_delay_ms}"></div></div><div class="settings-group"><h3>新用户默认值</h3><div class="form-row"><label>默认有效期 (天):</label><input id="s_default_expiry_days" type="number" value="${s.default_expiry_days}"></div><div class="form-row"><label>默认流量 (GB):</label><input id="s_default_limit_gb" type="number" value="${s.default_limit_gb}"></div></div></div><div class="action-buttons" style="justify-content: center; margin-top: 20px;"><button class="btn warning" onclick="saveSettings()">保存所有设置</button></div></div>`; }
-    function renderLogsPage() { contentArea.innerHTML = `<div class="card"><h2>系统日志 (最新200条)</h2><div id="log-viewer"></div></div>`; renderLogs(); }
-    function updateStatusBar() { const s = appState.status; if (!s) return; gid('current-user').textContent = appState.currentUser; gid('active-connections').textContent = s.active_conns || 0; gid('global-sent').textContent = formatBytes(s.global_sent); gid('global-received').textContent = formatBytes(s.global_rcvd); gid('server-uptime').textContent = s.uptime || '...'; gid('cpu-usage').textContent = s.cpu_percent ? `${s.cpu_percent.toFixed(1)}%` : '...'; gid('mem-usage').textContent = s.mem_percent ? `${(s.mem_used_bytes / 1024**3).toFixed(1)}GB (${s.mem_percent.toFixed(1)}%)` : '...'; }
-    function renderConnectionsTable() { const tbody = gid('connections-body'); if (!tbody) return; tbody.innerHTML = appState.connections.map(c => { const acc = appState.accounts[c.username] || {}; const t = appState.traffic[c.username] || { sent: 0, received: 0 }; const sent = formatBytes(t.sent); const received = formatBytes(t.received); const remaining = c.remaining_bytes === -1 ? '无限' : formatBytes(c.remaining_bytes); return `<tr><td>${acc.friendly_name || c.username}</td><td><span class="status-pill status-活跃">活跃</span></td><td>${sent}</td><td>${received}</td><td>${remaining}</td><td>${c.expiry_date || '无'}</td><td>${c.ip}</td><td>${formatTime(c.connect_time)}</td><td><button class="btn warning btn-sm" onclick="setDeviceStatus('${c.username}', false)">封禁</button></td></tr>`; }).join('') || '<tr><td colspan="9" style="text-align:center;">暂无连接</td></tr>'; }
-    function renderDevicesTable() { const tbody = gid('device-list-body'); if (!tbody) return; tbody.innerHTML = Object.entries(appState.accounts).filter(([_, acc]) => acc.enabled).sort((a,b) => (a[1].friendly_name || "").localeCompare(b[1].friendly_name || "")).map(([user, acc]) => { const t = appState.traffic[user] || { sent: 0, received: 0 }; const used = formatBytes(t.sent + t.received); const limit = acc.limit_gb > 0 ? `${acc.limit_gb} GB` : '无限'; const isExpired = acc.expiry_date && (new Date(acc.expiry_date).getTime() < new Date().setHours(0,0,0,0)); const status = isExpired ? 'expired' : 'normal'; const statusText = isExpired ? '过期' : '正常'; return `<tr id="device-row-${user}" onclick="fillDeviceForm('${user}')"><td><span class="status-pill status-${status}">${statusText}</span></td><td>${acc.friendly_name}</td><td><button class="btn info btn-sm" onclick="event.stopPropagation();copyToClipboard('${user}')">复制</button></td><td>${acc.expiry_date || '无'}</td><td>${used} / ${limit}</td><td>${acc.max_sessions > 0 ? acc.max_sessions : '不限'}</td><td><button class="btn danger btn-sm" onclick="event.stopPropagation();deleteAccount('${user}')">删除</button></td></tr>`; }).join('') || '<tr><td colspan="7" style="text-align:center;">暂无账号</td></tr>'; }
-    function renderBlacklistTable() { const tbody = gid('blacklist-table').querySelector('tbody'); if (!tbody) return; tbody.innerHTML = Object.entries(appState.accounts).filter(([_, acc]) => !acc.enabled).map(([user, acc]) => `<tr><td>${acc.friendly_name}</td><td>${user}</td><td><button class="btn secondary btn-sm" onclick="setDeviceStatus('${user}', true)">解封</button></td></tr>`).join('') || '<tr><td colspan="3" style="text-align:center;">暂无封禁账号</td></tr>'; }
-    function renderLogs() { const viewer = gid('log-viewer'); if (!viewer) return; viewer.textContent = appState.logs.join(''); viewer.scrollTop = viewer.scrollHeight; }
+
+    function showToast(message, type = 'success', duration = 3000) {
+        const container = gid('toast-container');
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.textContent = message;
+        container.appendChild(toast);
+        setTimeout(() => toast.classList.add('show'), 10);
+        setTimeout(() => { toast.classList.remove('show'); setTimeout(() => toast.remove(), 400); }, duration);
+    }
+    function showConfirm(title, message, onConfirm) {
+        const container = gid('modal-container');
+        container.innerHTML = `<div class="modal-overlay"><div class="modal-content"><h3>${title}</h3><p>${message}</p><div class="modal-buttons"><button class="btn secondary" id="modal-cancel">取消</button><button class="btn danger" id="modal-confirm">确认</button></div></div></div>`;
+        const overlay = container.querySelector('.modal-overlay');
+        setTimeout(() => overlay.classList.add('show'), 10);
+        const closeModal = () => { overlay.classList.remove('show'); setTimeout(() => container.innerHTML = '', 300); };
+        gid('modal-confirm').onclick = () => { onConfirm(); closeModal(); };
+        gid('modal-cancel').onclick = closeModal;
+    }
+    async function apiRequest(url, options = {}) {
+        if (options.body) options.headers = { ...options.headers, 'Content-Type': 'application/json' };
+        try {
+            const response = await fetch(url, options);
+            if (response.status === 401) { window.location.href = "/login.html"; return null; }
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.message || `HTTP error ${response.status}`);
+            return data;
+        } catch (error) {
+            console.error(`API Error for ${url}:`, error);
+            showToast(error.message, 'error');
+            return null;
+        }
+    }
+
+    // --- Page Renderers ---
+    function renderStatusPage() {
+        // 您的版本，保持不变
+        contentArea.innerHTML = `<div class="card"><div style="display:flex; justify-content: space-between; align-items: center;"><h2>连接状态</h2></div><div class="table-container"><table><thead><tr><th>账号名称</th><th>状态</th><th>上传</th><th>下载</th><th>剩余流量</th><th>有效期</th><th>IP地址</th><th>连接时间</th><th>操作</th></tr></thead><tbody id="connections-body"></tbody></table></div></div>`;
+        renderConnectionsTable();
+    }
+    function renderDevicePage() {
+        contentArea.innerHTML = `<div class="page-grid"><div class="card"><h3 style="margin:0;">账号列表</h3><div class="device-list-container"><table><thead><tr><th>状态</th><th>名称</th><th>用户名 (Key)</th><th>有效期</th><th>已用/总量</th><th>连接数</th><th>操作</th></tr></thead><tbody id="device-list-body"></tbody></table></div></div><div class="right-panel-wrapper"><div class="card form-panel"><h3 id="form-title" style="margin:0;">创建账号</h3><input type="hidden" id="current_editing_key"><div class="form-row"><label>友好名称:</label><input id="friendly_name" type="text" placeholder="e.g. MyPhone"></div><div class="form-row"><label>用户名:</label><input id="username" type="text" placeholder="e.g. user01"></div><div class="form-row"><label>密码:</label><input id="password" type="text"></div><div class="form-row"><label>有效期:</label><input id="expiry_date" type="date"></div><div class="form-row"><label>流量 (GB):</label><input id="limit_gb" type="number" placeholder="0为无限"></div><div class="form-row"><label>最大连接数:</label><input id="max_sessions" type="number" value="1"></div><div class="form-row" style="align-items:center;"><label>启用账号:</label><label class="toggle-switch"><input type="checkbox" id="enabled" checked><span class="slider"></span></label></div><div class="action-buttons" style="flex-direction:column; align-items:stretch; gap:8px; margin-top:20px;"><button class="btn info" onclick="generateNewDevice()">一键填充</button><button class="btn secondary" onclick="resetTraffic()">重置流量</button><button class="btn primary" onclick="saveAccount()">保存设置</button><button class="btn" style="background:#64748b" onclick="clearForm()">清空表单</button></div></div><div class="card"><h3 style="margin-top:0;">封禁列表</h3><div class="device-list-container" style="max-height: 200px;"><table id="blacklist-table"><thead><tr><th>名称</th><th>用户名</th><th>操作</th></tr></thead><tbody></tbody></table></div></div></div></div>`;
+        renderDevicesTable();
+        renderBlacklistTable();
+    }
+    function renderAccountPage() {
+        contentArea.innerHTML = `<div class="card" style="max-width:500px; margin: 12px auto;"><h2>面板密码设置</h2><p style="color:#64748b; font-size:13px;">在这里修改您当前登录的管理面板账号 (${appState.currentUser}) 的密码。</p><div class="form-row" style="flex-direction:column; align-items:stretch;"><label>旧密码:</label><input id="old_pass" type="password"></div><div class="form-row" style="flex-direction:column; align-items:stretch;"><label>新密码:</label><input id="new_pass" type="password"></div><div class="form-row" style="margin-top:20px;"><button class="btn secondary" onclick="updateAdminPassword()">更新密码</button></div></div>`;
+    }
+    function renderSettingsPage() {
+        const s = appState.settings;
+        if (!s) { contentArea.innerHTML = `<div class="card">正在加载设置...</div>`; return; }
+        contentArea.innerHTML = `<div class="card"><h2>系统设置</h2><p style="font-size:13px;color:#64748b;">修改这些设置后将保存到 config.json。有些设置可能需要重启程序才能完全生效。</p><div class="settings-grid"><div class="settings-group"><h3>握手与连接</h3><div class="form-row"><label>HTTP握手超时 (秒):</label><input id="s_handshake_timeout" type="number" value="${s.handshake_timeout}"></div><div class="form-row"><label>连接 User-Agent:</label><input id="s_connect_ua" type="text" value="${s.connect_ua}"></div><div class="form-row"><label>连接空闲超时 (秒):</label><input id="s_idle_timeout_seconds" type="number" value="${s.idle_timeout_seconds}"></div><div class="form-row"><label>目标连接超时 (秒):</label><input id="s_target_connect_timeout_seconds" type="number" value="${s.target_connect_timeout_seconds}"></div></div><div class="settings-group"><h3>性能与转发</h3><div class="form-row"><label>缓冲区大小 (KB):</label><input id="s_buffer_size_kb" type="number" value="${s.buffer_size_kb}"></div><div class="form-row"><label>网络错误重试次数:</label><input id="s_tolerant_copy_max_retries" type="number" value="${s.tolerant_copy_max_retries}"></div><div class="form-row"><label>错误重试延迟 (毫秒):</label><input id="s_tolerant_copy_retry_delay_ms" type="number" value="${s.tolerant_copy_retry_delay_ms}"></div></div><div class="settings-group"><h3>新用户默认值</h3><div class="form-row"><label>默认有效期 (天):</label><input id="s_default_expiry_days" type="number" value="${s.default_expiry_days}"></div><div class="form-row"><label>默认流量 (GB):</label><input id="s_default_limit_gb" type="number" value="${s.default_limit_gb}"></div></div></div><div class="action-buttons" style="justify-content: center; margin-top: 20px;"><button class="btn warning" onclick="saveSettings()">保存所有设置</button></div></div>`;
+    }
+    function renderLogsPage() {
+        contentArea.innerHTML = `<div class="card"><h2>系统日志 (最新200条)</h2><div id="log-viewer"></div></div>`;
+        renderLogs();
+    }
+
+    // --- Table & Content Updaters ---
+    function updateStatusBar() {
+        const s = appState.status;
+        if (!s) return;
+        gid('current-user').textContent = appState.currentUser;
+        gid('active-connections').textContent = s.active_conns || 0;
+        gid('global-sent').textContent = formatBytes(s.global_sent);
+        gid('global-received').textContent = formatBytes(s.global_rcvd);
+        gid('server-uptime').textContent = s.uptime || '...';
+        gid('cpu-usage').textContent = s.cpu_percent ? `${s.cpu_percent.toFixed(1)}%` : '...';
+        gid('mem-usage').textContent = s.mem_percent ? `${(s.mem_used_bytes / 1024**3).toFixed(1)}GB (${s.mem_percent.toFixed(1)}%)` : '...';
+    }
+    
+    // [按钮修复] 只修改了按钮的 onclick
+    function renderConnectionsTable() {
+        const tbody = gid('connections-body'); if (!tbody) return;
+        tbody.innerHTML = appState.connections.map(c => {
+            const acc = appState.accounts[c.username] || {};
+            // 您的这个数据获取逻辑是正确的，保持原样
+            const sent = formatBytes(c.sent_bytes); 
+            const received = formatBytes(c.received_bytes); 
+            const remaining = c.remaining_bytes === -1 ? '无限' : formatBytes(c.remaining_bytes);
+            return `<tr><td>${acc.friendly_name || c.username}</td><td><span class="status-pill status-活跃">活跃</span></td><td>${sent}</td><td>${received}</td><td>${remaining}</td><td>${c.expiry_date || '无'}</td><td>${c.ip}</td><td>${formatTime(c.connect_time)}</td><td><button class="btn warning btn-sm btn-ban" data-username="${c.username}">封禁</button></td></tr>`;
+        }).join('') || '<tr><td colspan="9" style="text-align:center;">暂无连接</td></tr>';
+    }
+    
+    // [按钮修复] 只修改了按钮的 onclick
+    function renderDevicesTable() {
+        const tbody = gid('device-list-body'); if (!tbody) return;
+        tbody.innerHTML = Object.entries(appState.accounts).filter(([_, acc]) => acc.enabled).sort((a,b) => (a[1].friendly_name || "").localeCompare(b[1].friendly_name || "")).map(([user, acc]) => {
+            const t = appState.traffic[user] || { sent: 0, received: 0 };
+            const used = formatBytes(t.sent + t.received);
+            const limit = acc.limit_gb > 0 ? `${acc.limit_gb} GB` : '无限';
+            const isExpired = acc.expiry_date && (new Date(acc.expiry_date).getTime() < new Date().setHours(0,0,0,0));
+            const status = isExpired ? 'expired' : 'normal';
+            const statusText = isExpired ? '过期' : '正常';
+            return `<tr id="device-row-${user}" onclick="fillDeviceForm('${user}')"><td><span class="status-pill status-${status}">${statusText}</span></td><td>${acc.friendly_name}</td><td><button class="btn info btn-sm" onclick="event.stopPropagation();copyToClipboard('${user}')">复制</button></td><td>${acc.expiry_date || '无'}</td><td>${used} / ${limit}</td><td>${acc.max_sessions > 0 ? acc.max_sessions : '不限'}</td><td><button class="btn danger btn-sm btn-delete" data-username="${user}">删除</button></td></tr>`;
+        }).join('') || '<tr><td colspan="7" style="text-align:center;">暂无账号</td></tr>';
+    }
+    
+    // [按钮修复] 只修改了按钮的 onclick
+    function renderBlacklistTable() {
+        const tbody = gid('blacklist-table').querySelector('tbody'); if (!tbody) return;
+        tbody.innerHTML = Object.entries(appState.accounts).filter(([_, acc]) => !acc.enabled).map(([user, acc]) => `<tr><td>${acc.friendly_name}</td><td>${user}</td><td><button class="btn secondary btn-sm btn-unban" data-username="${user}">解封</button></td></tr>`).join('') || '<tr><td colspan="3" style="text-align:center;">暂无封禁账号</td></tr>';
+    }
+    
+    // [日志修复] 只修改这一行
+    function renderLogs() {
+        const viewer = gid('log-viewer'); if (!viewer) return;
+        viewer.textContent = appState.logs.join('\n');
+        viewer.scrollTop = viewer.scrollHeight;
+    }
+
+    // --- Data Fetching ---
+    // 您的这个数据获取逻辑是正确的，保持原样
     async function updateDynamicData() {
         const path = window.location.hash || '#/status';
         const status = await apiRequest('/api/server_status');
         if (status) { appState.status = status; updateStatusBar(); } else { return; }
-        const promises = [apiRequest('/api/accounts')];
-        if (path === '#/status' || path === '#/device') { promises.push(apiRequest('/api/traffic')); }
-        if (path === '#/status') { promises.push(apiRequest('/api/connections')); }
-        if (path === '#/logs') { promises.push(apiRequest('/api/logs')); }
-        const [accounts, traffic, connections, logs] = await Promise.all(promises);
-        if(accounts) appState.accounts = accounts;
-        if(traffic) appState.traffic = traffic;
-        if (path === '#/status') { if (connections) appState.connections = connections; renderConnectionsTable(); } 
-        else if (path === '#/device') { renderDevicesTable(); renderBlacklistTable(); }
-        else if (path === '#/logs') { if (logs) { appState.logs = logs; renderLogs(); } }
+        
+        if (path === '#/status') {
+            const [conns, accounts] = await Promise.all([apiRequest('/api/connections'), apiRequest('/api/accounts')]);
+            if (conns) appState.connections = conns;
+            if (accounts) appState.accounts = accounts;
+            renderConnectionsTable();
+        } else if (path === '#/device') {
+            const [accounts, traffic] = await Promise.all([apiRequest('/api/accounts'), apiRequest('/api/traffic')]);
+            if (accounts) appState.accounts = accounts;
+            if (traffic) appState.traffic = traffic;
+            renderDevicesTable();
+            renderBlacklistTable();
+        } else if (path === '#/logs') {
+            const logs = await apiRequest('/api/logs');
+            if (logs) { appState.logs = logs; renderLogs(); }
+        }
     }
-    function fillDeviceForm(user) { const acc = appState.accounts[user]; if (!acc) return; gid('form-title').innerText = `编辑: ${acc.friendly_name}`; gid('current_editing_key').value = user; gid('friendly_name').value = acc.friendly_name; gid('username').value = user; gid('username').disabled = true; gid('password').value = ""; gid('password').placeholder = "留空不改"; gid('expiry_date').value = acc.expiry_date; gid('limit_gb').value = acc.limit_gb; gid('max_sessions').value = acc.max_sessions; gid('enabled').checked = acc.enabled; document.querySelectorAll('#device-list-body tr').forEach(r => r.classList.remove('highlight')); gid(`device-row-${user}`)?.classList.add('highlight'); }
-    function clearForm() { gid('form-title').innerText = '创建新账号'; ['current_editing_key', 'friendly_name', 'username', 'password', 'expiry_date', 'limit_gb'].forEach(id => gid(id).value = ''); gid('max_sessions').value = 1; gid('username').disabled = false; gid('password').placeholder = ""; gid('enabled').checked = true; document.querySelectorAll('#device-list-body tr').forEach(r => r.classList.remove('highlight')); }
-    async function saveAccount() { const user = gid('username').value.trim(); const origUser = gid('current_editing_key').value; let pass = gid('password').value; if (!user) return showToast('用户名不能为空', 'error'); if (!origUser && !pass) return showToast('新用户必须设置密码', 'error'); if (origUser && !pass) pass = appState.accounts[origUser].password; const payload = { password: pass, friendly_name: gid('friendly_name').value.trim() || user, enabled: gid('enabled').checked, expiry_date: gid('expiry_date').value, limit_gb: parseFloat(gid('limit_gb').value) || 0, max_sessions: parseInt(gid('max_sessions').value) || 0 }; const res = await apiRequest(`/api/accounts/${user}`, { method: 'POST', body: JSON.stringify(payload) }); if (res) { showToast(res.message); clearForm(); updateDynamicData(); } }
-    async function deleteAccount(user) { const name = appState.accounts[user]?.friendly_name || user; showConfirm('确认删除', `确定要永久删除账号 "${name}" (${user}) 吗？`, async () => { const res = await apiRequest(`/api/accounts/${user}`, { method: 'DELETE' }); if (res) { showToast(res.message); clearForm(); updateDynamicData(); } }); }
-    async function setDeviceStatus(user, isEnabled) { const action = isEnabled ? '解封' : '封禁'; const name = appState.accounts[user]?.friendly_name || user; showConfirm(`确认${action}`, `确定要${action}账号 "${name}" (${user}) 吗?`, async () => { const payload = { username: user, enabled: isEnabled }; const res = await apiRequest('/api/accounts/set_status', { method: 'POST', body: JSON.stringify(payload) }); if (res) { showToast(res.message); updateDynamicData(); } }); }
-    async function resetTraffic() { const user = gid('current_editing_key').value; if (!user) return showToast('请先在列表中选择一个用户', 'error'); showConfirm('确认重置', `确定要重置用户 "${user}" 的流量吗？`, async () => { const res = await apiRequest(`/api/accounts/reset-traffic`, {method: 'POST', body: JSON.stringify({username: user})}); if (res) { showToast(res.message); updateDynamicData(); } }); }
-    async function updateAdminPassword() { const old_pass = gid('old_pass').value; const new_pass = gid('new_pass').value; if (!old_pass || !new_pass) return showToast('新旧密码都不能为空', 'error'); const res = await apiRequest('/api/admin/update_password', {method:'POST', body: JSON.stringify({oldPassword: old_pass, newPassword: new_pass})}); if (res) { showToast(res.message); gid('old_pass').value = ''; gid('new_pass').value = ''; } }
-    function generateNewDevice() { clearForm(); gid('username').value = `user_${Math.random().toString(36).substring(2, 8)}`; gid('password').value = Math.random().toString(36).substring(2, 10); if(appState.settings) { const d = parseInt(appState.settings.default_expiry_days, 10) || 30; const t = new Date(); t.setDate(t.getDate() + d); gid('expiry_date').value = `${t.getFullYear()}-${('0'+(t.getMonth()+1)).slice(-2)}-${('0'+t.getDate()).slice(-2)}`; gid('limit_gb').value = appState.settings.default_limit_gb || 0; } showToast("新账号信息已填充", "success"); }
-    async function saveSettings() { const payload = { handshake_timeout: parseInt(gid('s_handshake_timeout').value,10), connect_ua: gid('s_connect_ua').value, buffer_size_kb: parseInt(gid('s_buffer_size_kb').value,10), idle_timeout_seconds: parseInt(gid('s_idle_timeout_seconds').value,10), tolerant_copy_max_retries: parseInt(gid('s_tolerant_copy_max_retries').value,10), tolerant_copy_retry_delay_ms: parseInt(gid('s_tolerant_copy_retry_delay_ms').value,10), target_connect_timeout_seconds: parseInt(gid('s_target_connect_timeout_seconds').value,10), default_expiry_days: parseInt(gid('s_default_expiry_days').value,10), default_limit_gb: parseFloat(gid('s_default_limit_gb').value) }; const res = await apiRequest('/api/settings', { method: 'POST', body: JSON.stringify(payload) }); if (res) { showToast(res.message); appState.settings = await apiRequest('/api/settings'); } }
-    function copyToClipboard(user) { const acc = appState.accounts[user]; if (!acc) { showToast("找不到账号信息", "error"); return; } const textToCopy = `用户名: ${user}\n密码: ${acc.password}`; if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(textToCopy).then( () => showToast('用户名和密码已复制'), () => showToast('复制失败', 'error') ); } else { const textArea = document.createElement('textarea'); textArea.value = textToCopy; textArea.style.position = 'fixed'; textArea.style.top = '-9999px'; textArea.style.left = '-9999px'; document.body.appendChild(textArea); textArea.focus(); textArea.select(); try { document.execCommand('copy'); showToast('用户名和密码已复制'); } catch (err) { showToast('复制失败', 'error'); } finally { document.body.removeChild(textArea); } } }
+
+    // --- Actions ---
+    function fillDeviceForm(user) {
+        const acc = appState.accounts[user]; if (!acc) return;
+        gid('form-title').innerText = `编辑: ${acc.friendly_name}`;
+        gid('current_editing_key').value = user;
+        gid('friendly_name').value = acc.friendly_name;
+        gid('username').value = user;
+        gid('username').disabled = true;
+        gid('password').value = "";
+        gid('password').placeholder = "留空不改";
+        gid('expiry_date').value = acc.expiry_date;
+        gid('limit_gb').value = acc.limit_gb;
+        gid('max_sessions').value = acc.max_sessions;
+        gid('enabled').checked = acc.enabled;
+        document.querySelectorAll('#device-list-body tr').forEach(r => r.classList.remove('highlight'));
+        gid(`device-row-${user}`)?.classList.add('highlight');
+    }
+    function clearForm() {
+        gid('form-title').innerText = '创建新账号';
+        ['current_editing_key', 'friendly_name', 'username', 'password', 'expiry_date', 'limit_gb'].forEach(id => gid(id).value = '');
+        gid('max_sessions').value = 1;
+        gid('username').disabled = false;
+        gid('password').placeholder = "";
+        gid('enabled').checked = true;
+        document.querySelectorAll('#device-list-body tr').forEach(r => r.classList.remove('highlight'));
+    }
+    async function saveAccount() {
+        const user = gid('username').value.trim();
+        if (!user) return showToast('用户名不能为空', 'error');
+        const origUser = gid('current_editing_key').value;
+        let pass = gid('password').value;
+        if (!origUser && !pass) return showToast('新用户必须设置密码', 'error');
+        if (origUser && !pass) pass = appState.accounts[origUser].password;
+        const payload = { password: pass, friendly_name: gid('friendly_name').value.trim() || user, enabled: gid('enabled').checked, expiry_date: gid('expiry_date').value, limit_gb: parseFloat(gid('limit_gb').value) || 0, max_sessions: parseInt(gid('max_sessions').value) || 0, };
+        const res = await apiRequest(`/api/accounts/${user}`, { method: 'POST', body: JSON.stringify(payload) });
+        if (res) { showToast(res.message); clearForm(); updateDynamicData(); }
+    }
+    async function deleteAccount(user) {
+        const name = appState.accounts[user]?.friendly_name || user;
+        showConfirm('确认删除', `确定要永久删除账号 "${name}" (${user}) 吗？`, async () => {
+            const res = await apiRequest(`/api/accounts/${user}`, { method: 'DELETE' });
+            if (res) { showToast(res.message); clearForm(); updateDynamicData(); }
+        });
+    }
+    async function setDeviceStatus(user, isEnabled) {
+        const action = isEnabled ? '解封' : '封禁';
+        const name = appState.accounts[user]?.friendly_name || user;
+        showConfirm(`确认${action}`, `确定要${action}账号 "${name}" (${user}) 吗?`, async () => {
+            const res = await apiRequest(`/api/accounts/set_status`, { method: 'POST', body: JSON.stringify({username: user, enabled: isEnabled})});
+            if (res) { showToast(res.message); updateDynamicData(); }
+        });
+    }
+    async function resetTraffic() {
+        const user = gid('current_editing_key').value;
+        if (!user) return showToast('请先在列表中选择一个用户', 'error');
+        showConfirm('确认重置', `确定要重置用户 "${user}" 的流量吗？`, async () => {
+            const res = await apiRequest(`/api/accounts/reset-traffic`, {method: 'POST', body: JSON.stringify({username: user})});
+            if (res) { showToast(res.message); updateDynamicData(); }
+        });
+    }
+    async function updateAdminPassword() {
+        const old_pass = gid('old_pass').value;
+        const new_pass = gid('new_pass').value;
+        if (!old_pass || !new_pass) return showToast('新旧密码都不能为空', 'error');
+        const res = await apiRequest('/api/admin/update_password', {method:'POST', body: JSON.stringify({oldPassword: old_pass, newPassword: new_pass})});
+        if (res) { showToast(res.message); gid('old_pass').value = ''; gid('new_pass').value = ''; }
+    }
+    function generateNewDevice() {
+        clearForm();
+        gid('username').value = `user_${Math.random().toString(36).substring(2, 8)}`;
+        gid('password').value = Math.random().toString(36).substring(2, 10);
+        if(appState.settings) {
+            const d = parseInt(appState.settings.default_expiry_days, 10) || 30;
+            const t = new Date();
+            t.setDate(t.getDate() + d);
+            gid('expiry_date').value = `${t.getFullYear()}-${('0'+(t.getMonth()+1)).slice(-2)}-${('0'+t.getDate()).slice(-2)}`;
+            gid('limit_gb').value = appState.settings.default_limit_gb || 0;
+        }
+        showToast("新账号信息已填充", "success");
+    }
+    async function saveSettings() {
+        const payload = { handshake_timeout: parseInt(gid('s_handshake_timeout').value, 10), connect_ua: gid('s_connect_ua').value, buffer_size_kb: parseInt(gid('s_buffer_size_kb').value, 10), idle_timeout_seconds: parseInt(gid('s_idle_timeout_seconds').value, 10), tolerant_copy_max_retries: parseInt(gid('s_tolerant_copy_max_retries').value, 10), tolerant_copy_retry_delay_ms: parseInt(gid('s_tolerant_copy_retry_delay_ms').value, 10), target_connect_timeout_seconds: parseInt(gid('s_target_connect_timeout_seconds').value, 10), default_expiry_days: parseInt(gid('s_default_expiry_days').value, 10), default_limit_gb: parseFloat(gid('s_default_limit_gb').value) };
+        const res = await apiRequest('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+        if (res) { showToast(res.message); appState.settings = await apiRequest('/api/settings'); }
+    }
+    function copyToClipboard(user) {
+        const acc = appState.accounts[user];
+        if(!acc) return;
+        const textToCopy = `用户名: ${user}\n密码: ${acc.password}`;
+        navigator.clipboard.writeText(textToCopy).then(() => showToast('用户名和密码已复制'), () => showToast('复制失败', 'error'));
+    }
+
+    // --- Router and Init ---
     const routes = { '#/status': renderStatusPage, '#/device': renderDevicePage, '#/account': renderAccountPage, '#/settings': renderSettingsPage, '#/logs': renderLogsPage };
-    async function router() { clearInterval(refreshInterval); const path = window.location.hash || '#/status'; document.querySelectorAll('.navbar a').forEach(a => a.classList.toggle('active', a.getAttribute('href') === path)); const renderFunc = routes[path] || routes['#/status']; renderFunc(); await updateDynamicData(); refreshInterval = setInterval(updateDynamicData, 5000); }
-    async function initializeApp() { const [status, settings, whoami] = await Promise.all([apiRequest('/api/server_status'), apiRequest('/api/settings'), apiRequest('/api/whoami')]); appState.status = status || {}; appState.settings = settings; appState.currentUser = whoami?.username || 'admin'; if (!window.location.hash) window.location.hash = '#/status'; await router(); }
+    async function router() {
+        clearInterval(refreshInterval);
+        const path = window.location.hash || '#/status';
+        document.querySelectorAll('.navbar a').forEach(a => a.classList.toggle('active', a.getAttribute('href') === path));
+        const renderFunc = routes[path] || routes['#/status'];
+        renderFunc();
+        await updateDynamicData();
+        refreshInterval = setInterval(updateDynamicData, 5000);
+    }
+    
+    // [按钮修复]
+    async function initializeApp() {
+        contentArea.addEventListener('click', function(event){
+            const target = event.target.closest('button');
+            if(!target) return;
+            
+            if (target.textContent === '复制') { return; }
+
+            const username = target.dataset.username;
+            if(!username) return;
+
+            event.stopPropagation();
+            if(target.classList.contains('btn-ban')) {
+                setDeviceStatus(username, false);
+            } else if (target.classList.contains('btn-unban')) {
+                setDeviceStatus(username, true);
+            } else if (target.classList.contains('btn-delete')) {
+                deleteAccount(username);
+            }
+        });
+
+        const [status, settings, whoami] = await Promise.all([apiRequest('/api/server_status'), apiRequest('/api/settings'), apiRequest('/api/whoami')]);
+        appState.status = status || {};
+        appState.settings = settings;
+        appState.currentUser = whoami?.username || 'admin';
+        if (!window.location.hash) window.location.hash = '#/status';
+        await router();
+    }
+    
     window.addEventListener('hashchange', router);
     document.addEventListener('DOMContentLoaded', initializeApp);
 </script>
