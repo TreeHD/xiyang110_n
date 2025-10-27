@@ -1,17 +1,24 @@
-// main.go (最终完整版 + 优雅退出 + 秒级配置)
+// main.go (最终集成版 + 优雅退出 + 秒级配置 + TLS/SNI + 443端口协议嗅探)
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -27,7 +34,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- 结构体及全局变量 ---
+// --- 结构体及全局变量 (无变动) ---
 
 type AccountInfo struct {
 	Password     string  `json:"password"`
@@ -40,6 +47,8 @@ type AccountInfo struct {
 
 type Config struct {
 	ListenAddr                  string                 `json:"listen_addr"`
+	ListenTLSAddr               string                 `json:"listen_tls_addr"`
+	AllowedSNI                  []string               `json:"allowed_sni"`
 	AdminAddr                   string                 `json:"admin_addr"`
 	AdminAccounts               map[string]string      `json:"admin_accounts"`
 	Accounts                    map[string]AccountInfo `json:"accounts"`
@@ -106,6 +115,8 @@ var globalLog = &LogCollector{maxCap: 200}
 
 const sessionCookieName = "wstunnel_admin_session"
 const trafficFileName = "traffic.json"
+const certFile = "cert.pem"
+const keyFile = "key.pem"
 
 type Session struct{ Username string; Expiry time.Time }
 
@@ -113,7 +124,7 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
-// --- 辅助函数 ---
+// --- 辅助函数 (无变动) ---
 
 func createSession(username string) *http.Cookie {
 	sessionTokenBytes := make([]byte, 32)
@@ -165,12 +176,10 @@ func saveTrafficData() error {
 		trafficToSave[key.(string)] = value.(*TrafficInfo)
 		return true
 	})
-
 	data, err := json.MarshalIndent(trafficToSave, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal traffic data: %w", err)
 	}
-
 	if err := ioutil.WriteFile(trafficFileName, data, 0644); err != nil {
 		return fmt.Errorf("failed to write traffic data to file: %w", err)
 	}
@@ -188,13 +197,11 @@ func loadTrafficData() {
 		log.Printf("System: Error reading traffic data file: %v", err)
 		return
 	}
-
 	var trafficFromFile map[string]*TrafficInfo
 	if err := json.Unmarshal(data, &trafficFromFile); err != nil {
 		log.Printf("System: Error parsing traffic data file: %v", err)
 		return
 	}
-
 	for username, trafficInfo := range trafficFromFile {
 		globalTraffic.Store(username, &TrafficInfo{
 			Sent:     atomic.LoadUint64(&trafficInfo.Sent),
@@ -204,7 +211,53 @@ func loadTrafficData() {
 	log.Printf("System: Successfully loaded %d user traffic records from %s", len(trafficFromFile), trafficFileName)
 }
 
-// --- 核心数据转发逻辑 ---
+func isSNIAllowed(sni string) bool {
+	globalConfig.lock.RLock()
+	defer globalConfig.lock.RUnlock()
+	for _, allowed := range globalConfig.AllowedSNI {
+		if strings.EqualFold(allowed, sni) {
+			return true
+		}
+	}
+	return false
+}
+
+func generateOrLoadTLSConfig() (*tls.Config, error) {
+	if _, err := os.Stat(certFile); os.IsNotExist(err) {
+		log.Printf("System: TLS certificate not found. Generating a new self-signed certificate...")
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil { return nil, fmt.Errorf("failed to generate private key: %w", err) }
+		serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+		serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+		if err != nil { return nil, fmt.Errorf("failed to generate serial number: %w", err) }
+		template := x509.Certificate{
+			SerialNumber: serialNumber,
+			Subject:      pkix.Name{Organization: []string{"WSTunnel Self-Signed"}},
+			NotBefore:    time.Now(),
+			NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}
+		derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+		if err != nil { return nil, fmt.Errorf("failed to create certificate: %w", err) }
+		certOut, err := os.Create(certFile)
+		if err != nil { return nil, fmt.Errorf("failed to open cert.pem for writing: %w", err) }
+		pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+		certOut.Close()
+		log.Printf("System: Saved certificate to %s", certFile)
+		keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		if err != nil { return nil, fmt.Errorf("failed to open key.pem for writing: %w", err) }
+		privBytes, _ := x509.MarshalPKCS8PrivateKey(priv)
+		pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+		keyOut.Close()
+		log.Printf("System: Saved private key to %s", keyFile)
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil { return nil, fmt.Errorf("failed to load TLS key pair: %w", err) }
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
+}
+
+// --- 核心数据转发逻辑 (无变动) ---
 
 type handshakeConn struct {
 	net.Conn
@@ -212,6 +265,7 @@ type handshakeConn struct {
 }
 
 func (hc *handshakeConn) Read(p []byte) (n int, err error) { return hc.r.Read(p) }
+
 func tolerantCopy(dst io.Writer, src io.Reader, direction string, remoteAddr net.Addr, username string) {
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
@@ -274,9 +328,7 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	} else {
 		destAddr = fmt.Sprintf("%s:%d", destHost, destPort)
 	}
-	
 	connectTimeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
-
 	destConn, err := net.DialTimeout("tcp", destAddr, connectTimeout)
 	if err != nil {
 		log.Printf("TCP Proxy: Failed to connect to %s for user %s: %v", destAddr, username, err)
@@ -284,13 +336,11 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 		return
 	}
 	defer destConn.Close()
-
 	if tcpConn, ok := destConn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(1 * time.Minute)
 	}
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -310,7 +360,8 @@ func handleDirectTCPIP(ch ssh.Channel, destHost string, destPort uint32, remoteA
 	wg.Wait()
 }
 
-// --- SSH & HTTP 握手与连接管理 ---
+// --- SSH & HTTP 握手与连接管理 (有改动) ---
+
 func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -326,53 +377,10 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 		}
 	}
 }
-func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
-	defer c.Close()
-	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
-	expectedUA := globalConfig.ConnectUA
-	reader := bufio.NewReader(c)
-	for {
-		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
-			return
-		}
-		for {
-			peekBytes, err := reader.Peek(1)
-			if err != nil {
-				return
-			}
-			if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
-				reader.ReadByte()
-				continue
-			}
-			break
-		}
-		req, err := http.ReadRequest(reader)
-		if err != nil {
-			return
-		}
-		io.Copy(ioutil.Discard, req.Body)
-		req.Body.Close()
-		if strings.Contains(req.UserAgent(), expectedUA) {
-			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-			if err != nil {
-				return
-			}
-			break
-		} else {
-			_, err := c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
-			if err != nil {
-				return
-			}
-			continue
-		}
-	}
-	time.Sleep(500 * time.Millisecond)
-	var preReadData []byte
-	if reader.Buffered() > 0 {
-		preReadData, _ = ioutil.ReadAll(reader)
-	}
-	finalReader := io.MultiReader(bytes.NewReader(preReadData), c)
-	connForSSH := &handshakeConn{Conn: c, r: finalReader}
+
+// [微调] handleSshConnection 现在接收一个 io.Reader，以处理预读数据
+func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
+	connForSSH := &handshakeConn{Conn: c, r: r}
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
 	if err != nil {
@@ -433,7 +441,113 @@ func handleSshConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
 	}
 }
 
-// --- Web服务器逻辑 ---
+// [新增] dispatchConnection - 新的智能分发器
+func dispatchConnection(c net.Conn, sshCfg *ssh.ServerConfig) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("FATAL: Panic recovered during dispatch for %s: %v", c.RemoteAddr(), r)
+		}
+		c.Close()
+	}()
+
+	tlsConn, ok := c.(*tls.Conn)
+	if !ok {
+		log.Printf("System: Dispatcher expected a TLS connection, but got something else.")
+		return
+	}
+
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
+		return
+	}
+
+	sni := tlsConn.ConnectionState().ServerName
+	if !isSNIAllowed(sni) {
+		log.Printf("System: Denied connection from %s due to invalid SNI: '%s'", c.RemoteAddr(), sni)
+		return
+	}
+
+	// 协议嗅探
+	reader := bufio.NewReader(c)
+	peekedBytes, err := reader.Peek(8) // 偷看8个字节足够判断
+	if err != nil {
+		if err != io.EOF {
+			log.Printf("System: Protocol sniffing failed for %s: %v", c.RemoteAddr(), err)
+		}
+		return
+	}
+
+	// 判断是SSH直连还是HTTP请求
+	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
+		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
+		handleSshConnection(c, reader, sshCfg)
+	} else { // 假设不是SSH直连，就当做HTTP处理
+		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
+		
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			log.Printf("System: Failed to read HTTP request from TLS stream for %s: %v", c.RemoteAddr(), err)
+			return
+		}
+		io.Copy(ioutil.Discard, req.Body)
+		req.Body.Close()
+
+		if strings.Contains(req.UserAgent(), globalConfig.ConnectUA) {
+			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
+			if err != nil {
+				log.Printf("System: Failed to write HTTP 101 response for %s: %v", c.RemoteAddr(), err)
+				return
+			}
+			// 成功后，将剩余的数据流交给SSH处理器
+			handleSshConnection(c, reader, sshCfg)
+		} else {
+			// 对于非法的HTTP请求，可以返回一个伪装的页面或错误
+			log.Printf("System: Rejected invalid HTTP request via TLS for %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
+			c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nPage not found."))
+		}
+	}
+}
+
+// 80端口的处理器，现在更简单，只处理HTTP Upgrade
+func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
+	defer c.Close()
+	timeoutDuration := time.Duration(globalConfig.HandshakeTimeout) * time.Second
+	expectedUA := globalConfig.ConnectUA
+	reader := bufio.NewReader(c)
+
+	for { // 循环是为了处理一些客户端可能会先发送空行的情况
+		if err := c.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil { return }
+		
+		peekBytes, err := reader.Peek(1)
+		if err != nil { return }
+		if peekBytes[0] == '\r' || peekBytes[0] == '\n' {
+			reader.ReadByte()
+			continue
+		}
+		
+		req, err := http.ReadRequest(reader)
+		if err != nil { return }
+		io.Copy(ioutil.Discard, req.Body)
+		req.Body.Close()
+
+		if strings.Contains(req.UserAgent(), expectedUA) {
+			_, err := c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
+			if err != nil { return }
+			
+			// 成功后，直接调用核心SSH处理器
+			handleSshConnection(c, reader, sshCfg)
+			return // 处理完毕，退出函数
+		} else {
+			// 对于非法的HTTP请求，直接关闭
+			log.Printf("System: Rejected invalid HTTP request on port 80 from %s (UA: %s)", c.RemoteAddr(), req.UserAgent())
+			c.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nBad Request."))
+			return
+		}
+	}
+}
+
+
+// --- Web服务器逻辑 (无变动) ---
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := validateSession(r); ok {
@@ -507,35 +621,18 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 			globalConfig.lock.RLock()
 			acc, ok := globalConfig.Accounts[u.Username]
 			globalConfig.lock.RUnlock()
-			if !ok {
-				return true
-			}
+			if !ok { return true }
 			t_val, _ := globalTraffic.LoadOrStore(u.Username, &TrafficInfo{})
 			t := t_val.(*TrafficInfo)
-
 			sentBytes := atomic.LoadUint64(&t.Sent)
 			receivedBytes := atomic.LoadUint64(&t.Received)
 			usedBytes := sentBytes + receivedBytes
-
 			var remainingBytes int64 = -1
 			if acc.LimitGB > 0 {
 				remainingBytes = int64(acc.LimitGB*1e9) - int64(usedBytes)
-				if remainingBytes < 0 {
-					remainingBytes = 0
-				}
+				if remainingBytes < 0 { remainingBytes = 0 }
 			}
-
-			conns = append(conns, map[string]interface{}{
-				"conn_id":         u.ConnID,
-				"username":        u.Username,
-				"ip":              u.RemoteAddr,
-				"connect_time":    u.ConnectTime,
-				"sent_bytes":      sentBytes,
-				"received_bytes":  receivedBytes,
-				"expiry_date":     acc.ExpiryDate,
-				"used_bytes":      usedBytes,
-				"remaining_bytes": remainingBytes,
-			})
+			conns = append(conns, map[string]interface{}{"conn_id": u.ConnID, "username": u.Username, "ip": u.RemoteAddr, "connect_time": u.ConnectTime, "sent_bytes": sentBytes, "received_bytes": receivedBytes, "expiry_date": acc.ExpiryDate, "used_bytes": usedBytes, "remaining_bytes": remainingBytes})
 			return true
 		})
 		sendJSON(w, http.StatusOK, conns)
@@ -544,189 +641,82 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		defer globalConfig.lock.RUnlock()
 		sendJSON(w, http.StatusOK, globalConfig.Accounts)
 	case r.URL.Path == "/api/accounts/set_status" && r.Method == "POST":
-		var payload struct {
-			Username string `json:"username"`
-			Enabled  bool   `json:"enabled"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
-			return
-		}
-
-		if payload.Username == "" {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
-			return
-		}
-
+		var payload struct { Username string `json:"username"`; Enabled bool `json:"enabled"` }
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }
+		if payload.Username == "" { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"}); return }
 		globalConfig.lock.Lock()
 		acc, ok := globalConfig.Accounts[payload.Username]
-		if !ok {
-			globalConfig.lock.Unlock()
-			sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"})
-			return
-		}
+		if !ok { globalConfig.lock.Unlock(); sendJSON(w, http.StatusNotFound, map[string]string{"message": "错误：用户不存在"}); return }
 		acc.Enabled = payload.Enabled
 		globalConfig.Accounts[payload.Username] = acc
 		if !payload.Enabled {
 			var connsToClose []ssh.Conn
 			onlineUsers.Range(func(_, v interface{}) bool {
 				u := v.(*OnlineUser)
-				if u.Username == payload.Username {
-					connsToClose = append(connsToClose, u.sshConn)
-				}
+				if u.Username == payload.Username { connsToClose = append(connsToClose, u.sshConn) }
 				return true
 			})
-			for _, conn := range connsToClose {
-				conn.Close()
-			}
+			for _, conn := range connsToClose { conn.Close() }
 		}
 		globalConfig.lock.Unlock()
 		safeSaveConfig()
-		
-		actionStr := "封禁"
-		if payload.Enabled { actionStr = "解封" }
-		successMessage := fmt.Sprintf("账号 %s 已成功%s", payload.Username, actionStr)
+		actionStr := "封禁"; if payload.Enabled { actionStr = "解封" }; successMessage := fmt.Sprintf("账号 %s 已成功%s", payload.Username, actionStr)
 		sendJSON(w, http.StatusOK, map[string]string{"message": successMessage})
-
 	case r.URL.Path == "/api/accounts/reset-traffic" && r.Method == "POST":
 		var p struct{ Username string `json:"username"` }
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
-			return
-		}
-		if p.Username == "" {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
-			return
-		}
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }
+		if p.Username == "" { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"}); return }
 		if v, ok := globalTraffic.Load(p.Username); ok {
 			t := v.(*TrafficInfo)
-			atomic.StoreUint64(&t.Sent, 0)
-			atomic.StoreUint64(&t.Received, 0)
+			atomic.StoreUint64(&t.Sent, 0); atomic.StoreUint64(&t.Received, 0)
 			sendJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("账号 %s 的流量已重置", p.Username)})
-		} else {
-			sendJSON(w, http.StatusNotFound, map[string]string{"message": "未找到该用户的流量记录，无法重置"})
-		}
-	
+		} else { sendJSON(w, http.StatusNotFound, map[string]string{"message": "未找到该用户的流量记录，无法重置"}) }
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "POST":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		if username == "" {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"})
-			return
-		}
-
+		if username == "" { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：用户名不能为空"}); return }
 		var newInfo AccountInfo
-		// Need to decode into a temp structure to check password
-		bodyBytes, _ := ioutil.ReadAll(r.Body)
-		r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes)) // re-buffer body for next read
-		
-		tempInfo := struct {
-			Password *string `json:"password"`
-		}{}
-		json.Unmarshal(bodyBytes, &tempInfo)
-		json.Unmarshal(bodyBytes, &newInfo)
-
-
+		bodyBytes, _ := ioutil.ReadAll(r.Body); r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+		tempInfo := struct { Password *string `json:"password"` }{}; json.Unmarshal(bodyBytes, &tempInfo); json.Unmarshal(bodyBytes, &newInfo)
 		globalConfig.lock.Lock()
 		existingInfo, isUpdate := globalConfig.Accounts[username]
-		
-		if isUpdate {
-			if tempInfo.Password == nil { // Password field was not in the request JSON
-				newInfo.Password = existingInfo.Password
-			}
-		} else if newInfo.Password == "" {
-			globalConfig.lock.Unlock()
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "新用户必须提供密码"})
-			return
-		}
-		
+		if isUpdate { if tempInfo.Password == nil { newInfo.Password = existingInfo.Password } } else if newInfo.Password == "" { globalConfig.lock.Unlock(); sendJSON(w, http.StatusBadRequest, map[string]string{"message": "新用户必须提供密码"}); return }
 		globalConfig.Accounts[username] = newInfo
 		globalConfig.lock.Unlock()
-
-		if err := safeSaveConfig(); err != nil {
-			sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败"})
-			return
-		}
+		if err := safeSaveConfig(); err != nil { sendJSON(w, http.StatusInternalServerError, map[string]string{"message": "保存配置失败"}); return }
 		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 更新成功"})
-
 	case strings.HasPrefix(r.URL.Path, "/api/accounts/") && r.Method == "DELETE":
 		username := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
-		if username == "" {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：不能删除空用户名的账户"})
-			return
-		}
-		globalConfig.lock.Lock()
-		delete(globalConfig.Accounts, username)
-		globalConfig.lock.Unlock()
-		safeSaveConfig()
+		if username == "" { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "错误：不能删除空用户名的账户"}); return }
+		globalConfig.lock.Lock(); delete(globalConfig.Accounts, username); globalConfig.lock.Unlock(); safeSaveConfig()
 		sendJSON(w, http.StatusOK, map[string]string{"message": "账户 " + username + " 删除成功"})
 	case strings.HasPrefix(r.URL.Path, "/api/connections/") && r.Method == "DELETE":
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
-		if user, ok := onlineUsers.Load(connID); ok {
-			user.(*OnlineUser).sshConn.Close()
-			sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"})
-		}
+		if user, ok := onlineUsers.Load(connID); ok { user.(*OnlineUser).sshConn.Close(); sendJSON(w, http.StatusOK, map[string]string{"message": "连接已断开"}) }
 	case r.URL.Path == "/api/admin/update_password" && r.Method == "POST":
-		var payload struct {
-			OldPassword string `json:"oldPassword"`
-			NewPassword string `json:"newPassword"`
-		}
-		if json.NewDecoder(r.Body).Decode(&payload) != nil {
-			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"})
-			return
-		}
+		var payload struct { OldPassword string `json:"oldPassword"`; NewPassword string `json:"newPassword"`}
+		if json.NewDecoder(r.Body).Decode(&payload) != nil { sendJSON(w, http.StatusBadRequest, map[string]string{"message": "无效请求"}); return }
 		user, _ := validateSession(r)
 		globalConfig.lock.Lock()
 		if globalConfig.AdminAccounts[user] == payload.OldPassword {
 			globalConfig.AdminAccounts[user] = payload.NewPassword
-			globalConfig.lock.Unlock()
-			safeSaveConfig()
-			sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
-		} else {
-			globalConfig.lock.Unlock()
-			sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"})
-		}
+			globalConfig.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
+		} else { globalConfig.lock.Unlock(); sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"}) }
 	case r.URL.Path == "/api/settings":
-		if r.Method == "GET" {
-			globalConfig.lock.RLock()
-			defer globalConfig.lock.RUnlock()
-			sendJSON(w, http.StatusOK, globalConfig)
-		}
+		if r.Method == "GET" { globalConfig.lock.RLock(); defer globalConfig.lock.RUnlock(); sendJSON(w, http.StatusOK, globalConfig) }
 		if r.Method == "POST" {
-			var newSettings Config
-			json.NewDecoder(r.Body).Decode(&newSettings)
+			var newSettings Config; json.NewDecoder(r.Body).Decode(&newSettings)
 			globalConfig.lock.Lock()
-			globalConfig.HandshakeTimeout = newSettings.HandshakeTimeout
-			globalConfig.ConnectUA = newSettings.ConnectUA
-			globalConfig.BufferSizeKB = newSettings.BufferSizeKB
-			globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds
-			globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries
-			globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs
-			globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds
-			globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays
-			globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
+			globalConfig.HandshakeTimeout = newSettings.HandshakeTimeout; globalConfig.ConnectUA = newSettings.ConnectUA; globalConfig.BufferSizeKB = newSettings.BufferSizeKB; globalConfig.IdleTimeoutSeconds = newSettings.IdleTimeoutSeconds; globalConfig.TolerantCopyMaxRetries = newSettings.TolerantCopyMaxRetries; globalConfig.TolerantCopyRetryDelayMs = newSettings.TolerantCopyRetryDelayMs; globalConfig.TargetConnectTimeoutSeconds = newSettings.TargetConnectTimeoutSeconds; globalConfig.DefaultExpiryDays = newSettings.DefaultExpiryDays; globalConfig.DefaultLimitGB = newSettings.DefaultLimitGB
 			globalConfig.lock.Unlock()
 			safeSaveConfig()
-			bufferPool = sync.Pool{New: func() interface{} {
-				buf := make([]byte, globalConfig.BufferSizeKB*1024)
-				return &buf
-			}}
+			bufferPool = sync.Pool{New: func() interface{} { buf := make([]byte, globalConfig.BufferSizeKB*1024); return &buf }}
 			sendJSON(w, http.StatusOK, map[string]string{"message": "设置已保存"})
 		}
-	case r.URL.Path == "/api/logs":
-		sendJSON(w, http.StatusOK, globalLog.GetLogs())
+	case r.URL.Path == "/api/logs": sendJSON(w, http.StatusOK, globalLog.GetLogs())
 	case r.URL.Path == "/api/traffic":
-		trafficData := make(map[string]*TrafficInfo)
-		globalTraffic.Range(func(k, v interface{}) bool {
-			trafficData[k.(string)] = v.(*TrafficInfo)
-			return true
-		})
-		sendJSON(w, http.StatusOK, trafficData)
-	case r.URL.Path == "/api/whoami":
-		if user, ok := validateSession(r); ok {
-			sendJSON(w, http.StatusOK, map[string]string{"username": user})
-		}
-	default:
-		http.NotFound(w, r)
+		trafficData := make(map[string]*TrafficInfo); globalTraffic.Range(func(k, v interface{}) bool { trafficData[k.(string)] = v.(*TrafficInfo); return true }); sendJSON(w, http.StatusOK, trafficData)
+	case r.URL.Path == "/api/whoami": if user, ok := validateSession(r); ok { sendJSON(w, http.StatusOK, map[string]string{"username": user}) }
+	default: http.NotFound(w, r)
 	}
 }
 // --- main ---
@@ -742,6 +732,7 @@ func main() {
 		log.Fatalf("FATAL: Cannot parse config.json: %v", err)
 	}
 
+	if globalConfig.ListenTLSAddr == "" { globalConfig.ListenTLSAddr = ":443" }
 	if globalConfig.AdminAddr == "" { globalConfig.AdminAddr = "127.0.0.1:9090" }
 	if globalConfig.HandshakeTimeout <= 0 { globalConfig.HandshakeTimeout = 5 }
 	if globalConfig.ConnectUA == "" { globalConfig.ConnectUA = "wstunnel" }
@@ -751,12 +742,14 @@ func main() {
 	if globalConfig.TolerantCopyMaxRetries <= 0 { globalConfig.TolerantCopyMaxRetries = 100 }
 	if globalConfig.TolerantCopyRetryDelayMs <= 0 { globalConfig.TolerantCopyRetryDelayMs = 500 }
 	if globalConfig.TargetConnectTimeoutSeconds <= 0 { globalConfig.TargetConnectTimeoutSeconds = 10 }
-    if globalConfig.TrafficSaveIntervalSeconds <= 0 { globalConfig.TrafficSaveIntervalSeconds = 300 } // Default to 300 seconds (5 minutes)
+    if globalConfig.TrafficSaveIntervalSeconds <= 0 { globalConfig.TrafficSaveIntervalSeconds = 300 }
 
     log.Println("==================================================")
     log.Println("          WSTunnel Service Starting Up")
     log.Println("==================================================")
-    log.Printf("  Listen Addr: %s", globalConfig.ListenAddr)
+    log.Printf("  Listen Addr (HTTP Upgrade): %s", globalConfig.ListenAddr)
+	log.Printf("  Listen Addr (TLS Multiplexer): %s  <-- SUPER PORT", globalConfig.ListenTLSAddr)
+	log.Printf("  Allowed SNI Hosts: %v", globalConfig.AllowedSNI)
     log.Printf("  Admin Panel Addr: %s", globalConfig.AdminAddr)
     log.Println("------------------ Behaviors ---------------------")
     log.Printf("  Handshake Timeout: %d seconds", globalConfig.HandshakeTimeout)
@@ -794,26 +787,19 @@ func main() {
 		return &buf
 	}}
 
-	// [修改] 将监听器提取出来，以便后续可以关闭
-	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
-	if err != nil {
-		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
-	}
-	log.Printf("System: SSH server listening on %s", globalConfig.ListenAddr)
+	var wg sync.WaitGroup
 
-	// [修改] 将 http server 的启动也放入 goroutine
 	adminServer := &http.Server{Addr: globalConfig.AdminAddr}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		mux := http.NewServeMux()
 		mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "login.html") })
 		mux.HandleFunc("/login", loginHandler)
 		mux.HandleFunc("/logout", logoutHandler)
 		mux.HandleFunc("/api/", authMiddleware(apiHandler))
 		mux.HandleFunc("/", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/" {
-				http.ServeFile(w, r, "admin.html")
-				return
-			}
+			if r.URL.Path == "/" { http.ServeFile(w, r, "admin.html"); return }
 			http.NotFound(w, r)
 		}))
 		adminServer.Handler = mux
@@ -830,38 +816,24 @@ func main() {
 			globalConfig.lock.RLock()
 			acc, ok := globalConfig.Accounts[user]
 			globalConfig.lock.RUnlock()
-			if !ok || !acc.Enabled {
-				return nil, fmt.Errorf("auth failed")
-			}
+			if !ok || !acc.Enabled { return nil, fmt.Errorf("auth failed") }
 			if acc.ExpiryDate != "" {
 				exp, err := time.Parse("2006-01-02", acc.ExpiryDate)
-				if err != nil || time.Now().After(exp.Add(24*time.Hour)) {
-					return nil, fmt.Errorf("user expired")
-				}
+				if err != nil || time.Now().After(exp.Add(24*time.Hour)) { return nil, fmt.Errorf("user expired") }
 			}
 			if acc.LimitGB > 0 {
 				v, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
 				t := v.(*TrafficInfo)
-				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) {
-					return nil, fmt.Errorf("traffic limit exceeded")
-				}
+				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) { return nil, fmt.Errorf("traffic limit exceeded") }
 			}
 			if acc.MaxSessions > 0 {
 				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
 				countPtr := v.(*int32)
-				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) {
-					return nil, fmt.Errorf("max sessions exceeded")
-				}
+				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) { return nil, fmt.Errorf("max sessions exceeded") }
 				atomic.AddInt32(countPtr, 1)
 			}
-			if string(p) == acc.Password {
-				return nil, nil
-			}
-			if acc.MaxSessions > 0 {
-				if v, ok := userConnectionCount.Load(user); ok {
-					atomic.AddInt32(v.(*int32), -1)
-				}
-			}
+			if string(p) == acc.Password { return nil, nil }
+			if acc.MaxSessions > 0 { if v, ok := userConnectionCount.Load(user); ok { atomic.AddInt32(v.(*int32), -1) } }
 			return nil, fmt.Errorf("invalid credentials")
 		},
 	}
@@ -869,54 +841,63 @@ func main() {
 	key, _ := ssh.NewSignerFromKey(priv)
 	sshCfg.AddHostKey(key)
 
-	// [新增] 优雅退出逻辑
+	// 普通TCP监听器 (HTTP Upgrade) - 完整保留
+	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
+	if err != nil {
+		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
+	}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		log.Printf("System: HTTP Upgrade server listening on %s", globalConfig.ListenAddr)
 		for {
 			conn, err := sshListener.Accept()
 			if err != nil {
-				// 当 sshListener.Close() 被调用时，这里会收到一个错误，循环自然退出
-				log.Printf("System: SSH listener stopped. %v", err)
+				log.Printf("System: SSH listener (HTTP Upgrade) stopped. %v", err)
 				return
 			}
-			go func(c net.Conn) {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("FATAL: Panic recovered for %s: %v", c.RemoteAddr(), r)
-					}
-				}()
-				handleSshConnection(c, sshCfg)
-			}(conn)
+			go handleHttpUpgrade(conn, sshCfg)
 		}
 	}()
 
-	// [新增] 监听系统信号，实现优雅退出
+	// “超级 443 端口” 的实现
+	tlsConfig, err := generateOrLoadTLSConfig()
+	if err != nil {
+		log.Fatalf("FATAL: Could not configure TLS: %v", err)
+	}
+	tlsListener, err := tls.Listen("tcp", globalConfig.ListenTLSAddr, tlsConfig)
+	if err != nil {
+		log.Fatalf("FATAL: Cannot listen on TLS %s: %v", globalConfig.ListenTLSAddr, err)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Printf("System: Super TLS multiplexing server listening on %s", globalConfig.ListenTLSAddr)
+		for {
+			conn, err := tlsListener.Accept()
+			if err != nil {
+				log.Printf("System: Super TLS listener stopped. %v", err)
+				return
+			}
+			go dispatchConnection(conn, sshCfg)
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit // 阻塞在这里，直到收到退出信号
+	<-quit
 
 	log.Println("==================================================")
 	log.Println("         WSTunnel Service Shutting Down...")
 	log.Println("==================================================")
 
-	// 关闭 HTTP 服务器
-	if err := adminServer.Close(); err != nil {
-		log.Printf("System: Error closing admin panel: %v", err)
-	} else {
-		log.Println("System: Admin panel gracefully shut down.")
-	}
-
-	// 关闭 SSH 监听器
-	if err := sshListener.Close(); err != nil {
-		log.Printf("System: Error closing SSH listener: %v", err)
-	} else {
-		log.Println("System: SSH listener gracefully shut down.")
-	}
-
-	// 在退出前，最后保存一次流量数据
+	if err := adminServer.Close(); err != nil { log.Printf("System: Error closing admin panel: %v", err) } else { log.Println("System: Admin panel gracefully shut down.") }
+	if err := sshListener.Close(); err != nil { log.Printf("System: Error closing SSH listener (HTTP Upgrade): %v", err) } else { log.Println("System: SSH listener (HTTP Upgrade) gracefully shut down.") }
+	if err := tlsListener.Close(); err != nil { log.Printf("System: Error closing SSH listener (TLS): %v", err) } else { log.Println("System: SSH listener (TLS) gracefully shut down.") }
+	
 	log.Println("System: Performing final traffic data save...")
-	if err := saveTrafficData(); err != nil {
-		log.Printf("System: Error during final traffic data save: %v", err)
-	}
-
+	if err := saveTrafficData(); err != nil { log.Printf("System: Error during final traffic data save: %v", err) }
+	
+	wg.Wait()
 	log.Println("Shutdown complete.")
 }
