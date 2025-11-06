@@ -1,4 +1,4 @@
-// main.go (最终健壮版：修复在线状态、竞态条件和TLS连接问题)
+// main.go (最终健壮版：修复SSH握手死锁及所有已知问题)
 package main
 
 import (
@@ -73,7 +73,8 @@ type OnlineUser struct {
 	Username    string    `json:"username"`
 	RemoteAddr  string    `json:"remote_addr"`
 	ConnectTime time.Time `json:"connect_time"`
-	sshSession  ssh.Session
+	// [FIX] 使用 ssh.Context 替代 ssh.Session，以便能断开所有类型的连接
+	sshCtx ssh.Context
 }
 
 var onlineUsers sync.Map
@@ -124,38 +125,29 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
-// --- singleConnListener 适配器 ---
+// --- [最终修正] singleConnListener 适配器 (修复死锁问题) ---
 type singleConnListener struct {
-	conn   net.Conn
-	once   sync.Once
-	closed chan struct{}
+	conn     net.Conn
+	mu       sync.Mutex
+	accepted bool
 }
 
 func newSingleConnListener(conn net.Conn) net.Listener {
-	return &singleConnListener{
-		conn:   conn,
-		closed: make(chan struct{}),
-	}
+	return &singleConnListener{conn: conn}
 }
 
+// Accept 返回唯一的连接，且只返回一次。后续调用将立即返回 io.EOF。
 func (l *singleConnListener) Accept() (net.Conn, error) {
-	var conn net.Conn
-	l.once.Do(func() {
-		conn = l.conn
-	})
-	if conn != nil {
-		return conn, nil
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.accepted {
+		return nil, io.EOF
 	}
-	<-l.closed
-	return nil, io.EOF
+	l.accepted = true
+	return l.conn, nil
 }
 
 func (l *singleConnListener) Close() error {
-	select {
-	case <-l.closed:
-	default:
-		close(l.closed)
-	}
 	return l.conn.Close()
 }
 
@@ -323,7 +315,6 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
-		// [FIX] 添加了明确的日志
 		log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
 		c.Close()
 		return
@@ -345,7 +336,6 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
-		// [FIX] 移除了不稳定的 time.Sleep
 		go func() {
 			err := server.Serve(newSingleConnListener(c))
 			if err != nil && err != io.EOF {
@@ -378,7 +368,6 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 			}
 		}
 
-		// [FIX] 移除了不稳定的 time.Sleep
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
 		go func() {
 			err := server.Serve(newSingleConnListener(wrappedConn))
@@ -416,7 +405,6 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 		}
 	}
 	
-	// [FIX] 移除了不稳定的 time.Sleep
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
 	go func() {
 		err := server.Serve(newSingleConnListener(wrappedConn))
@@ -519,7 +507,8 @@ func apiConnectionsHandler(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == "DELETE" {
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
 		if user, ok := onlineUsers.Load(connID); ok {
-			user.(*OnlineUser).sshSession.Context().Close()
+			// [FIX] 使用 context 来关闭连接
+			user.(*OnlineUser).sshCtx.Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接 " + connID + " 已断开"})
 		} else {
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
@@ -575,7 +564,7 @@ func apiAccountSetStatusHandler(w http.ResponseWriter, r *http.Request) {
 		onlineUsers.Range(func(_, v interface{}) bool {
 			u := v.(*OnlineUser)
 			if u.Username == payload.Username {
-				u.sshSession.Context().Close()
+				u.sshCtx.Close()
 			}
 			return true
 		})
@@ -821,7 +810,6 @@ func main() {
 		}
 	}()
 	
-	// --- charmbracelet/ssh 服务器设置 ---
 	server := &ssh.Server{
 		Version: "SSH-2.0-WSTunnel_Pro",
 		IdleTimeout: time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second,
@@ -844,60 +832,47 @@ func main() {
 			log.Printf("Auth failed for user '%s': invalid credentials", user)
 			return false
 		},
-		// [FIX] 使用 ConnCallback 管理用户上线和会话计数，修复不显示在线和竞态条件问题
 		ConnCallback: func(ctx ssh.Context, conn net.Conn) net.Conn {
 			user := ctx.User()
 			globalConfig.lock.RLock()
 			acc, _ := globalConfig.Accounts[user]
 			globalConfig.lock.RUnlock()
 
-			// 原子地增加和检查会话数
 			if acc.MaxSessions > 0 {
 				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
 				countPtr := v.(*int32)
-				// 先增加，再检查
 				newCount := atomic.AddInt32(countPtr, 1) 
 				if newCount > int32(acc.MaxSessions) {
 					log.Printf("Auth success but connection denied for user '%s': max sessions exceeded (%d/%d)", user, newCount, acc.MaxSessions)
-					// 必须在这里就把计数值减回去
 					atomic.AddInt32(countPtr, -1) 
 					ctx.Close()
 					return conn
 				}
 			}
 			
-			// 记录用户上线
 			onlineUser := &OnlineUser{
 				ConnID:      ctx.SessionID(),
 				Username:    user,
 				RemoteAddr:  ctx.RemoteAddr().String(),
 				ConnectTime: time.Now(),
-				sshSession:  nil, // Session 对象在 Session Handler 中才会被创建
+				sshCtx:      ctx,
 			}
 			onlineUsers.Store(onlineUser.ConnID, onlineUser)
 			log.Printf("User '%s' connected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
 			return conn
 		},
-		// [FIX] 使用 CloseHandler 管理用户下线
-		CloseHandler: func(ctx ssh.Context, err error) {
+		CloseHandler: func(ctx ssh.Context) {
 			user := ctx.User()
-			// 减少会话计数
 			if v, ok := userConnectionCount.Load(user); ok {
 				atomic.AddInt32(v.(*int32), -1)
 			}
-			// 移除在线用户记录
 			onlineUsers.Delete(ctx.SessionID())
 			log.Printf("User '%s' disconnected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
 		},
 		Handler: func(s ssh.Session) {
-			// 将 session 对象关联到 onlineUser，以便后台可以主动断开
-			if u, ok := onlineUsers.Load(s.Context().SessionID()); ok {
-				onlineUser := u.(*OnlineUser)
-				onlineUser.sshSession = s
-				onlineUsers.Store(s.Context().SessionID(), onlineUser)
-			}
-			// 这个 Handler 仍然需要，以保持 session 存活
-			<-s.Context().Done()
+			// 仅当客户端请求一个 shell 会话时，这个 Handler 才会被调用。
+			// 对于纯隧道，它不会被调用，但我们需要它来防止程序因未处理 session 请求而崩溃。
+			io.WriteString(s, "This is a tunnel-only server. No shell access is provided.\n")
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":      ssh.DefaultSessionHandler,
@@ -909,8 +884,6 @@ func main() {
 	signer, _ := gossh.NewSignerFromKey(priv)
 	server.AddHostKey(signer)
 	
-	// --- 启动监听器 ---
-
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
 	if err != nil {
 		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
