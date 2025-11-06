@@ -862,6 +862,7 @@ func main() {
 	sshCfg := &ssh.ServerConfig{
 		ServerVersion: "SSH-2.0-WSTunnel_Pro",
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
+			// ... 您的认证逻辑保持不变 ...
 			user := c.User()
 			globalConfig.lock.RLock()
 			acc, ok := globalConfig.Accounts[user]
@@ -886,9 +887,25 @@ func main() {
 			if acc.MaxSessions > 0 { if v, ok := userConnectionCount.Load(user); ok { atomic.AddInt32(v.(*int32), -1) } }
 			return nil, fmt.Errorf("invalid credentials")
 		},
+		// +++ 最终的、完整的性能优化配置 +++
 		Config: ssh.Config{
+			// 抽屉1: 提供一个明确、安全的密钥交换(KEX)算法列表
+			KeyExchanges: []string{
+				"mlkem768x25519-sha256",
+				"curve25519-sha256@libssh.org",
+				"ecdh-sha2-nistp256",
+			},
+
+			// 抽屉3: 强制使用我们想要的、对手机最优的加密(Cipher)算法
 			Ciphers: []string{
 				"chacha20-poly1305@openssh.com",
+			},
+
+			// 抽屉4 (关键修正!): 必须提供一个明确、安全的消息认证码(MAC)算法列表
+			MACs: []string{
+				"hmac-sha2-512-etm@openssh.com",
+				"hmac-sha2-256-etm@openssh.com",
+				"hmac-sha2-256", // 增加兼容性选项
 			},
 		},
 	}
