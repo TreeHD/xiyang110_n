@@ -1,4 +1,4 @@
-// main.go (已添加核心数据转发逻辑并集成流量统计)
+// main.go (最终修正版：修复所有编译错误，实现完整的数据转发逻辑)
 package main
 
 import (
@@ -33,6 +33,7 @@ import (
 	"github.com/charmbracelet/ssh"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
+	// 导入底层的 crypto/ssh 库，并使用 gossh 别名
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -665,6 +666,79 @@ func apiWhoamiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// --- [最终修正] 完整的自定义隧道处理器 ---
+// 该函数实现了 ssh.ChannelHandler 接口，用于处理 "direct-tcpip" (端口转发) 请求。
+// 这是保证隧道能够联网的核心。
+func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
+	// 1. 解析请求数据，获取目标地址和端口
+	// direct-tcpip 请求的附加数据中包含了目标信息
+	type tcpipMessage struct {
+		Host       string
+		Port       uint32
+		Originator string
+		OriginPort uint32
+	}
+	var msg tcpipMessage
+	if err := gossh.Unmarshal(newChan.ExtraData(), &msg); err != nil {
+		log.Printf("User '%s': failed to parse direct-tcpip request: %v", ctx.User(), err)
+		newChan.Reject(gossh.UnknownChannelType, "failed to parse request")
+		return
+	}
+
+	targetAddr := net.JoinHostPort(msg.Host, fmt.Sprintf("%d", msg.Port))
+	user := ctx.User()
+
+	// 2. 连接到目标地址
+	// 使用配置的超时时间
+	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	targetConn, err := net.DialTimeout("tcp", targetAddr, timeout)
+	if err != nil {
+		log.Printf("User '%s': failed to connect to target %s: %v", user, targetAddr, err)
+		newChan.Reject(gossh.ConnectionFailed, fmt.Sprintf("failed to connect to target: %v", err))
+		return
+	}
+
+	// 3. 接受来自客户端的 SSH 通道
+	channel, reqs, err := newChan.Accept()
+	if err != nil {
+		log.Printf("User '%s': could not accept channel to %s: %v", user, targetAddr, err)
+		targetConn.Close()
+		return
+	}
+	
+	log.Printf("User '%s' created a tunnel from %s to %s", user, ctx.RemoteAddr(), targetAddr)
+
+	// 4. 在后台丢弃所有与通道相关的带外请求
+	go gossh.DiscardRequests(reqs)
+
+	// 5. 启动双向数据拷贝，并进行流量统计
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	traffic, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
+	userTraffic := traffic.(*TrafficInfo)
+
+	// 客户端 -> 目标 (上传流量)
+	go func() {
+		defer wg.Done()
+		defer channel.Close()
+		defer targetConn.Close()
+		written, _ := io.Copy(targetConn, channel)
+		atomic.AddUint64(&userTraffic.Sent, uint64(written))
+	}()
+
+	// 目标 -> 客户端 (下载流量)
+	go func() {
+		defer wg.Done()
+		defer channel.Close()
+		defer targetConn.Close()
+		written, _ := io.Copy(channel, targetConn)
+		atomic.AddUint64(&userTraffic.Received, uint64(written))
+	}()
+
+	wg.Wait()
+	log.Printf("User '%s' tunnel to %s closed.", user, targetAddr)
+}
 
 // --- main ---
 func main() {
@@ -763,55 +837,7 @@ func main() {
 		}
 	}()
 	
-	// --- [核心修正] 自定义隧道处理器 ---
-	forwardHandler := &ssh.DirectTCPIPHandler{}
-	
-	// 这个自定义 Handler 是让隧道能够转发数据的关键
-	forwardHandler.Handler = func(ctx ssh.Context, conn net.Conn, newChan ssh.NewChannel) {
-		log.Printf("User '%s' from %s is creating a tunnel to %s", ctx.User(), ctx.RemoteAddr(), conn.RemoteAddr())
-		
-		// 接受客户端的通道
-		channel, reqs, err := newChan.Accept()
-		if err != nil {
-			log.Printf("User '%s' could not accept channel: %v", ctx.User(), err)
-			conn.Close()
-			return
-		}
-		
-		// 在后台丢弃所有带外请求
-		go ssh.DiscardRequests(reqs)
-		
-		// 启动双向数据拷贝
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		user := ctx.User()
-		traffic, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
-		userTraffic := traffic.(*TrafficInfo)
-
-		// 客户端 -> 目标 (上传流量)
-		go func() {
-			defer wg.Done()
-			defer channel.Close()
-			defer conn.Close()
-			written, _ := io.Copy(conn, channel)
-			atomic.AddUint64(&userTraffic.Sent, uint64(written))
-		}()
-
-		// 目标 -> 客户端 (下载流量)
-		go func() {
-			defer wg.Done()
-			defer channel.Close()
-			defer conn.Close()
-			written, _ := io.Copy(channel, conn)
-			atomic.AddUint64(&userTraffic.Received, uint64(written))
-		}()
-
-		wg.Wait()
-		log.Printf("User '%s' tunnel to %s closed.", user, conn.RemoteAddr())
-	}
-	
-	// --- 新的 charmbracelet/ssh 服务器设置 ---
+	// --- charmbracelet/ssh 服务器设置 ---
 	server := &ssh.Server{
 		Version: "SSH-2.0-WSTunnel_Pro",
 		IdleTimeout: time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second,
@@ -859,8 +885,8 @@ func main() {
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":      ssh.DefaultSessionHandler,
-			// --- [核心修正] 使用我们自定义的带数据转发功能的处理器 ---
-			"direct-tcpip": forwardHandler.HandleChan,
+			// --- [最终修正] 注册我们自定义的、功能完整的隧道处理器 ---
+			"direct-tcpip": handleDirectTCPIP,
 		},
 	}
 	
