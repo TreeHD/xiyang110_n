@@ -1,4 +1,4 @@
-// main.go (最终健壮版：修复SSH握手死锁及所有已知问题)
+// main.go (最终健壮版：修复所有编译错误和生命周期管理)
 package main
 
 import (
@@ -73,8 +73,9 @@ type OnlineUser struct {
 	Username    string    `json:"username"`
 	RemoteAddr  string    `json:"remote_addr"`
 	ConnectTime time.Time `json:"connect_time"`
-	// [FIX] 使用 ssh.Context 替代 ssh.Session，以便能断开所有类型的连接
-	sshCtx ssh.Context
+	// [FIX] 保存 net.Conn 以便能从外部关闭连接
+	sshCtx  ssh.Context
+	netConn net.Conn
 }
 
 var onlineUsers sync.Map
@@ -125,7 +126,6 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
-// --- [最终修正] singleConnListener 适配器 (修复死锁问题) ---
 type singleConnListener struct {
 	conn     net.Conn
 	mu       sync.Mutex
@@ -136,7 +136,6 @@ func newSingleConnListener(conn net.Conn) net.Listener {
 	return &singleConnListener{conn: conn}
 }
 
-// Accept 返回唯一的连接，且只返回一次。后续调用将立即返回 io.EOF。
 func (l *singleConnListener) Accept() (net.Conn, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -507,8 +506,8 @@ func apiConnectionsHandler(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == "DELETE" {
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
 		if user, ok := onlineUsers.Load(connID); ok {
-			// [FIX] 使用 context 来关闭连接
-			user.(*OnlineUser).sshCtx.Close()
+			// [FIX] 使用 net.Conn 来关闭连接
+			user.(*OnlineUser).netConn.Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接 " + connID + " 已断开"})
 		} else {
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
@@ -564,7 +563,7 @@ func apiAccountSetStatusHandler(w http.ResponseWriter, r *http.Request) {
 		onlineUsers.Range(func(_, v interface{}) bool {
 			u := v.(*OnlineUser)
 			if u.Username == payload.Username {
-				u.sshCtx.Close()
+				u.netConn.Close()
 			}
 			return true
 		})
@@ -844,8 +843,9 @@ func main() {
 				newCount := atomic.AddInt32(countPtr, 1) 
 				if newCount > int32(acc.MaxSessions) {
 					log.Printf("Auth success but connection denied for user '%s': max sessions exceeded (%d/%d)", user, newCount, acc.MaxSessions)
-					atomic.AddInt32(countPtr, -1) 
-					ctx.Close()
+					atomic.AddInt32(countPtr, -1)
+					// [FIX] 正确的关闭方式是直接关闭底层的 net.Conn
+					conn.Close()
 					return conn
 				}
 			}
@@ -856,22 +856,24 @@ func main() {
 				RemoteAddr:  ctx.RemoteAddr().String(),
 				ConnectTime: time.Now(),
 				sshCtx:      ctx,
+				netConn:     conn, // 保存 net.Conn
 			}
 			onlineUsers.Store(onlineUser.ConnID, onlineUser)
 			log.Printf("User '%s' connected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
+
+			// [FIX] 使用 ctx.Done() 来管理连接的生命周期
+			go func() {
+				<-ctx.Done() // 阻塞直到连接关闭
+				if v, ok := userConnectionCount.Load(user); ok {
+					atomic.AddInt32(v.(*int32), -1)
+				}
+				onlineUsers.Delete(ctx.SessionID())
+				log.Printf("User '%s' disconnected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
+			}()
+
 			return conn
 		},
-		CloseHandler: func(ctx ssh.Context) {
-			user := ctx.User()
-			if v, ok := userConnectionCount.Load(user); ok {
-				atomic.AddInt32(v.(*int32), -1)
-			}
-			onlineUsers.Delete(ctx.SessionID())
-			log.Printf("User '%s' disconnected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
-		},
 		Handler: func(s ssh.Session) {
-			// 仅当客户端请求一个 shell 会话时，这个 Handler 才会被调用。
-			// 对于纯隧道，它不会被调用，但我们需要它来防止程序因未处理 session 请求而崩溃。
 			io.WriteString(s, "This is a tunnel-only server. No shell access is provided.\n")
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
