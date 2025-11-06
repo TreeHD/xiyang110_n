@@ -1,4 +1,4 @@
-// main.go (最终修正版：修复所有编译错误，实现完整的数据转发逻辑)
+// main.go (最终健壮版：修复在线状态、竞态条件和TLS连接问题)
 package main
 
 import (
@@ -33,7 +33,6 @@ import (
 	"github.com/charmbracelet/ssh"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
-	// 导入底层的 crypto/ssh 库，并使用 gossh 别名
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -324,6 +323,8 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
+		// [FIX] 添加了明确的日志
+		log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
 		c.Close()
 		return
 	}
@@ -344,7 +345,7 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
-		time.Sleep(500 * time.Millisecond)
+		// [FIX] 移除了不稳定的 time.Sleep
 		go func() {
 			err := server.Serve(newSingleConnListener(c))
 			if err != nil && err != io.EOF {
@@ -377,8 +378,7 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 			}
 		}
 
-		time.Sleep(500 * time.Millisecond)
-		
+		// [FIX] 移除了不稳定的 time.Sleep
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
 		go func() {
 			err := server.Serve(newSingleConnListener(wrappedConn))
@@ -416,8 +416,7 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 		}
 	}
 	
-	time.Sleep(500 * time.Millisecond)
-	
+	// [FIX] 移除了不稳定的 time.Sleep
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
 	go func() {
 		err := server.Serve(newSingleConnListener(wrappedConn))
@@ -520,7 +519,7 @@ func apiConnectionsHandler(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == "DELETE" {
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
 		if user, ok := onlineUsers.Load(connID); ok {
-			user.(*OnlineUser).sshSession.Close()
+			user.(*OnlineUser).sshSession.Context().Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接 " + connID + " 已断开"})
 		} else {
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
@@ -573,13 +572,13 @@ func apiAccountSetStatusHandler(w http.ResponseWriter, r *http.Request) {
 	acc.Enabled = payload.Enabled
 	globalConfig.Accounts[payload.Username] = acc
 	if !payload.Enabled {
-		var connsToClose []ssh.Session
 		onlineUsers.Range(func(_, v interface{}) bool {
 			u := v.(*OnlineUser)
-			if u.Username == payload.Username { connsToClose = append(connsToClose, u.sshSession) }
+			if u.Username == payload.Username {
+				u.sshSession.Context().Close()
+			}
 			return true
 		})
-		for _, sess := range connsToClose { sess.Close() }
 	}
 	globalConfig.lock.Unlock()
 	safeSaveConfig()
@@ -666,12 +665,7 @@ func apiWhoamiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- [最终修正] 完整的自定义隧道处理器 ---
-// 该函数实现了 ssh.ChannelHandler 接口，用于处理 "direct-tcpip" (端口转发) 请求。
-// 这是保证隧道能够联网的核心。
 func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
-	// 1. 解析请求数据，获取目标地址和端口
-	// direct-tcpip 请求的附加数据中包含了目标信息
 	type tcpipMessage struct {
 		Host       string
 		Port       uint32
@@ -688,8 +682,6 @@ func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.Ne
 	targetAddr := net.JoinHostPort(msg.Host, fmt.Sprintf("%d", msg.Port))
 	user := ctx.User()
 
-	// 2. 连接到目标地址
-	// 使用配置的超时时间
 	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
 	targetConn, err := net.DialTimeout("tcp", targetAddr, timeout)
 	if err != nil {
@@ -698,7 +690,6 @@ func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.Ne
 		return
 	}
 
-	// 3. 接受来自客户端的 SSH 通道
 	channel, reqs, err := newChan.Accept()
 	if err != nil {
 		log.Printf("User '%s': could not accept channel to %s: %v", user, targetAddr, err)
@@ -707,18 +698,13 @@ func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.Ne
 	}
 	
 	log.Printf("User '%s' created a tunnel from %s to %s", user, ctx.RemoteAddr(), targetAddr)
-
-	// 4. 在后台丢弃所有与通道相关的带外请求
 	go gossh.DiscardRequests(reqs)
 
-	// 5. 启动双向数据拷贝，并进行流量统计
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	traffic, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
 	userTraffic := traffic.(*TrafficInfo)
 
-	// 客户端 -> 目标 (上传流量)
 	go func() {
 		defer wg.Done()
 		defer channel.Close()
@@ -726,8 +712,6 @@ func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.Ne
 		written, _ := io.Copy(targetConn, channel)
 		atomic.AddUint64(&userTraffic.Sent, uint64(written))
 	}()
-
-	// 目标 -> 客户端 (下载流量)
 	go func() {
 		defer wg.Done()
 		defer channel.Close()
@@ -856,36 +840,67 @@ func main() {
 				t := v.(*TrafficInfo)
 				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) { log.Printf("Auth failed for user '%s': traffic limit exceeded", user); return false }
 			}
-			if acc.MaxSessions > 0 {
-				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
-				countPtr := v.(*int32)
-				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) { log.Printf("Auth failed for user '%s': max sessions exceeded", user); return false }
-			}
 			if password == acc.Password { return true }
 			log.Printf("Auth failed for user '%s': invalid credentials", user)
 			return false
 		},
-		Handler: func(s ssh.Session) {
-			user := s.User()
-			connID := s.Context().SessionID()
-			if val, ok := userConnectionCount.Load(user); ok {
-				atomic.AddInt32(val.(*int32), 1)
-			}
-			onlineUser := &OnlineUser{ConnID: connID, Username: user, RemoteAddr: s.RemoteAddr().String(), ConnectTime: time.Now(), sshSession: s}
-			onlineUsers.Store(onlineUser.ConnID, onlineUser)
-			log.Printf("Auth success for user '%s' from %s (SessionID: %s)", user, s.RemoteAddr(), connID)
-			defer func() {
-				if val, ok := userConnectionCount.Load(user); ok {
-					atomic.AddInt32(val.(*int32), -1)
+		// [FIX] 使用 ConnCallback 管理用户上线和会话计数，修复不显示在线和竞态条件问题
+		ConnCallback: func(ctx ssh.Context, conn net.Conn) net.Conn {
+			user := ctx.User()
+			globalConfig.lock.RLock()
+			acc, _ := globalConfig.Accounts[user]
+			globalConfig.lock.RUnlock()
+
+			// 原子地增加和检查会话数
+			if acc.MaxSessions > 0 {
+				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
+				countPtr := v.(*int32)
+				// 先增加，再检查
+				newCount := atomic.AddInt32(countPtr, 1) 
+				if newCount > int32(acc.MaxSessions) {
+					log.Printf("Auth success but connection denied for user '%s': max sessions exceeded (%d/%d)", user, newCount, acc.MaxSessions)
+					// 必须在这里就把计数值减回去
+					atomic.AddInt32(countPtr, -1) 
+					ctx.Close()
+					return conn
 				}
-				onlineUsers.Delete(onlineUser.ConnID)
-				log.Printf("Session closed for user '%s' from %s (SessionID: %s)", user, s.RemoteAddr(), connID)
-			}()
+			}
+			
+			// 记录用户上线
+			onlineUser := &OnlineUser{
+				ConnID:      ctx.SessionID(),
+				Username:    user,
+				RemoteAddr:  ctx.RemoteAddr().String(),
+				ConnectTime: time.Now(),
+				sshSession:  nil, // Session 对象在 Session Handler 中才会被创建
+			}
+			onlineUsers.Store(onlineUser.ConnID, onlineUser)
+			log.Printf("User '%s' connected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
+			return conn
+		},
+		// [FIX] 使用 CloseHandler 管理用户下线
+		CloseHandler: func(ctx ssh.Context, err error) {
+			user := ctx.User()
+			// 减少会话计数
+			if v, ok := userConnectionCount.Load(user); ok {
+				atomic.AddInt32(v.(*int32), -1)
+			}
+			// 移除在线用户记录
+			onlineUsers.Delete(ctx.SessionID())
+			log.Printf("User '%s' disconnected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
+		},
+		Handler: func(s ssh.Session) {
+			// 将 session 对象关联到 onlineUser，以便后台可以主动断开
+			if u, ok := onlineUsers.Load(s.Context().SessionID()); ok {
+				onlineUser := u.(*OnlineUser)
+				onlineUser.sshSession = s
+				onlineUsers.Store(s.Context().SessionID(), onlineUser)
+			}
+			// 这个 Handler 仍然需要，以保持 session 存活
 			<-s.Context().Done()
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":      ssh.DefaultSessionHandler,
-			// --- [最终修正] 注册我们自定义的、功能完整的隧道处理器 ---
 			"direct-tcpip": handleDirectTCPIP,
 		},
 	}
