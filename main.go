@@ -1,4 +1,4 @@
-// main.go (已根据建议修正和优化)
+// main.go (已修正编译错误)
 package main
 
 import (
@@ -305,7 +305,8 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
 		time.Sleep(500 * time.Millisecond)
-		go server.Serve(c)
+		// *** FIX: Use Handle for a single connection, not Serve ***
+		go server.Handle(c)
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 		
@@ -335,7 +336,8 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		time.Sleep(500 * time.Millisecond)
 		
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
-		go server.Serve(wrappedConn)
+		// *** FIX: Use Handle for a single connection, not Serve ***
+		go server.Handle(wrappedConn)
 	}
 }
 
@@ -369,7 +371,8 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 	time.Sleep(500 * time.Millisecond)
 	
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
-	go server.Serve(wrappedConn)
+	// *** FIX: Use Handle for a single connection, not Serve ***
+	go server.Handle(wrappedConn)
 }
 
 
@@ -552,7 +555,6 @@ func apiAdminUpdatePasswordHandler(w http.ResponseWriter, r *http.Request) {
 	globalConfig.lock.Lock()
 	if globalConfig.AdminAccounts[user] == payload.OldPassword {
 		globalConfig.AdminAccounts[user] = payload.NewPassword
-		// *** FIX: Corrected variable name from `global` to `globalConfig` ***
 		globalConfig.lock.Unlock() 
 		safeSaveConfig()
 		sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
@@ -689,7 +691,7 @@ func main() {
 		mux.HandleFunc("/login", loginHandler)
 		mux.HandleFunc("/logout", logoutHandler)
 		
-		// *** REFACTOR: Registering individual API handlers ***
+		// Registering individual API handlers
 		mux.HandleFunc("/api/server_status", authMiddleware(apiServerStatusHandler))
 		mux.HandleFunc("/api/connections", authMiddleware(apiConnectionsHandler)) // GET
 		mux.HandleFunc("/api/connections/", authMiddleware(apiConnectionsHandler)) // DELETE
@@ -720,7 +722,6 @@ func main() {
 	
 	server := &ssh.Server{
 		Version: "SSH-2.0-WSTunnel_Pro",
-		// *** FIX: Apply idle timeout from config to the SSH server ***
 		IdleTimeout: time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second,
 
 		PasswordHandler: func(ctx ssh.Context, password string) bool {
@@ -788,9 +789,8 @@ func main() {
 				log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
 			}()
 			
-			// *** FIX: Correctly wait for the session to end instead of blocking indefinitely.
-			// This allows channel handlers like `direct-tcpip` to work properly. ***
-			s.Wait()
+			// *** FIX: Correctly wait for the session context to be done. ***
+			<-s.Context().Done()
 		},
 		
 		ChannelHandlers: map[string]ssh.ChannelHandler{
