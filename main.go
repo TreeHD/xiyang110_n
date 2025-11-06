@@ -1,4 +1,4 @@
-// main.go (最终健壮版：修复所有编译错误和生命周期管理)
+// main.go (最终修正版：修复所有编译错误，实现在线用户和实时流量统计)
 package main
 
 import (
@@ -33,6 +33,7 @@ import (
 	"github.com/charmbracelet/ssh"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
+	// 导入底层的 crypto/ssh 库，并使用 gossh 别名
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -73,9 +74,7 @@ type OnlineUser struct {
 	Username    string    `json:"username"`
 	RemoteAddr  string    `json:"remote_addr"`
 	ConnectTime time.Time `json:"connect_time"`
-	// [FIX] 保存 net.Conn 以便能从外部关闭连接
-	sshCtx  ssh.Context
-	netConn net.Conn
+	sshSession  ssh.Session
 }
 
 var onlineUsers sync.Map
@@ -126,27 +125,38 @@ var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
 
+// --- singleConnListener 适配器 ---
 type singleConnListener struct {
-	conn     net.Conn
-	mu       sync.Mutex
-	accepted bool
+	conn   net.Conn
+	once   sync.Once
+	closed chan struct{}
 }
 
 func newSingleConnListener(conn net.Conn) net.Listener {
-	return &singleConnListener{conn: conn}
+	return &singleConnListener{
+		conn:   conn,
+		closed: make(chan struct{}),
+	}
 }
 
 func (l *singleConnListener) Accept() (net.Conn, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.accepted {
-		return nil, io.EOF
+	var conn net.Conn
+	l.once.Do(func() {
+		conn = l.conn
+	})
+	if conn != nil {
+		return conn, nil
 	}
-	l.accepted = true
-	return l.conn, nil
+	<-l.closed
+	return nil, io.EOF
 }
 
 func (l *singleConnListener) Close() error {
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+	}
 	return l.conn.Close()
 }
 
@@ -296,6 +306,86 @@ type handshakeConn struct {
 
 func (hc *handshakeConn) Read(p []byte) (n int, err error) { return hc.r.Read(p) }
 
+type countingWriter struct {
+	io.Writer
+	counter *uint64
+}
+
+func (w *countingWriter) Write(p []byte) (n int, err error) {
+	n, err = w.Writer.Write(p)
+	if n > 0 {
+		atomic.AddUint64(w.counter, uint64(n))
+	}
+	return
+}
+
+func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
+	type tcpipMessage struct {
+		Host       string
+		Port       uint32
+		Originator string
+		OriginPort uint32
+	}
+	var msg tcpipMessage
+	if err := gossh.Unmarshal(newChan.ExtraData(), &msg); err != nil {
+		log.Printf("User '%s': failed to parse direct-tcpip request: %v", ctx.User(), err)
+		newChan.Reject(gossh.UnknownChannelType, "failed to parse request")
+		return
+	}
+
+	targetAddr := net.JoinHostPort(msg.Host, fmt.Sprintf("%d", msg.Port))
+	user := ctx.User()
+
+	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
+	targetConn, err := net.DialTimeout("tcp", targetAddr, timeout)
+	if err != nil {
+		log.Printf("User '%s': failed to connect to target %s: %v", user, targetAddr, err)
+		newChan.Reject(gossh.ConnectionFailed, fmt.Sprintf("failed to connect to target: %v", err))
+		return
+	}
+
+	channel, reqs, err := newChan.Accept()
+	if err != nil {
+		log.Printf("User '%s': could not accept channel to %s: %v", user, targetAddr, err)
+		targetConn.Close()
+		return
+	}
+	
+	log.Printf("User '%s' created a tunnel from %s to %s", user, ctx.RemoteAddr(), targetAddr)
+	go gossh.DiscardRequests(reqs)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	traffic, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
+	userTraffic := traffic.(*TrafficInfo)
+	
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	
+	go func() {
+		defer wg.Done()
+		defer channel.Close()
+		defer targetConn.Close()
+		
+		writerWithCounter := &countingWriter{Writer: targetConn, counter: &userTraffic.Sent}
+		io.CopyBuffer(writerWithCounter, channel, buf)
+	}()
+
+	go func() {
+		defer wg.Done()
+		defer channel.Close()
+		defer targetConn.Close()
+		
+		writerWithCounter := &countingWriter{Writer: channel, counter: &userTraffic.Received}
+		io.CopyBuffer(writerWithCounter, targetConn, buf)
+	}()
+
+	wg.Wait()
+	bufferPool.Put(bufPtr)
+	log.Printf("User '%s' tunnel to %s closed.", user, targetAddr)
+}
+
 
 // --- SSH & HTTP 握手与连接管理 ---
 
@@ -314,7 +404,6 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	}
 
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("System: TLS handshake failed for %s: %v", c.RemoteAddr(), err)
 		c.Close()
 		return
 	}
@@ -335,9 +424,10 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
+		time.Sleep(500 * time.Millisecond)
 		go func() {
 			err := server.Serve(newSingleConnListener(c))
-			if err != nil && err != io.EOF {
+			if err != nil && err != io.EOF && !strings.Contains(err.Error(), "closed") {
 				log.Printf("System: ssh.Serve (direct) failed for %s: %v", c.RemoteAddr(), err)
 			}
 		}()
@@ -367,10 +457,12 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 			}
 		}
 
+		time.Sleep(500 * time.Millisecond)
+		
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
 		go func() {
 			err := server.Serve(newSingleConnListener(wrappedConn))
-			if err != nil && err != io.EOF {
+			if err != nil && err != io.EOF && !strings.Contains(err.Error(), "closed") {
 				log.Printf("System: ssh.Serve (http-upgrade/tls) failed for %s: %v", c.RemoteAddr(), err)
 			}
 		}()
@@ -404,10 +496,12 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 		}
 	}
 	
+	time.Sleep(500 * time.Millisecond)
+	
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
 	go func() {
 		err := server.Serve(newSingleConnListener(wrappedConn))
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "closed") {
 			log.Printf("System: ssh.Serve (http-upgrade/plain) failed for %s: %v", c.RemoteAddr(), err)
 		}
 	}()
@@ -506,8 +600,7 @@ func apiConnectionsHandler(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == "DELETE" {
 		connID := strings.TrimPrefix(r.URL.Path, "/api/connections/")
 		if user, ok := onlineUsers.Load(connID); ok {
-			// [FIX] 使用 net.Conn 来关闭连接
-			user.(*OnlineUser).netConn.Close()
+			user.(*OnlineUser).sshSession.Close()
 			sendJSON(w, http.StatusOK, map[string]string{"message": "连接 " + connID + " 已断开"})
 		} else {
 			sendJSON(w, http.StatusNotFound, map[string]string{"message": "连接未找到"})
@@ -560,13 +653,13 @@ func apiAccountSetStatusHandler(w http.ResponseWriter, r *http.Request) {
 	acc.Enabled = payload.Enabled
 	globalConfig.Accounts[payload.Username] = acc
 	if !payload.Enabled {
+		var connsToClose []ssh.Session
 		onlineUsers.Range(func(_, v interface{}) bool {
 			u := v.(*OnlineUser)
-			if u.Username == payload.Username {
-				u.netConn.Close()
-			}
+			if u.Username == payload.Username { connsToClose = append(connsToClose, u.sshSession) }
 			return true
 		})
+		for _, sess := range connsToClose { sess.Close() }
 	}
 	globalConfig.lock.Unlock()
 	safeSaveConfig()
@@ -651,65 +744,6 @@ func apiWhoamiHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		sendJSON(w, http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
 	}
-}
-
-func handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
-	type tcpipMessage struct {
-		Host       string
-		Port       uint32
-		Originator string
-		OriginPort uint32
-	}
-	var msg tcpipMessage
-	if err := gossh.Unmarshal(newChan.ExtraData(), &msg); err != nil {
-		log.Printf("User '%s': failed to parse direct-tcpip request: %v", ctx.User(), err)
-		newChan.Reject(gossh.UnknownChannelType, "failed to parse request")
-		return
-	}
-
-	targetAddr := net.JoinHostPort(msg.Host, fmt.Sprintf("%d", msg.Port))
-	user := ctx.User()
-
-	timeout := time.Duration(globalConfig.TargetConnectTimeoutSeconds) * time.Second
-	targetConn, err := net.DialTimeout("tcp", targetAddr, timeout)
-	if err != nil {
-		log.Printf("User '%s': failed to connect to target %s: %v", user, targetAddr, err)
-		newChan.Reject(gossh.ConnectionFailed, fmt.Sprintf("failed to connect to target: %v", err))
-		return
-	}
-
-	channel, reqs, err := newChan.Accept()
-	if err != nil {
-		log.Printf("User '%s': could not accept channel to %s: %v", user, targetAddr, err)
-		targetConn.Close()
-		return
-	}
-	
-	log.Printf("User '%s' created a tunnel from %s to %s", user, ctx.RemoteAddr(), targetAddr)
-	go gossh.DiscardRequests(reqs)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	traffic, _ := globalTraffic.LoadOrStore(user, &TrafficInfo{})
-	userTraffic := traffic.(*TrafficInfo)
-
-	go func() {
-		defer wg.Done()
-		defer channel.Close()
-		defer targetConn.Close()
-		written, _ := io.Copy(targetConn, channel)
-		atomic.AddUint64(&userTraffic.Sent, uint64(written))
-	}()
-	go func() {
-		defer wg.Done()
-		defer channel.Close()
-		defer targetConn.Close()
-		written, _ := io.Copy(channel, targetConn)
-		atomic.AddUint64(&userTraffic.Received, uint64(written))
-	}()
-
-	wg.Wait()
-	log.Printf("User '%s' tunnel to %s closed.", user, targetAddr)
 }
 
 // --- main ---
@@ -809,6 +843,7 @@ func main() {
 		}
 	}()
 	
+	// --- charmbracelet/ssh 服务器设置 ---
 	server := &ssh.Server{
 		Version: "SSH-2.0-WSTunnel_Pro",
 		IdleTimeout: time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second,
@@ -827,54 +862,38 @@ func main() {
 				t := v.(*TrafficInfo)
 				if atomic.LoadUint64(&t.Sent)+atomic.LoadUint64(&t.Received) >= uint64(acc.LimitGB*1e9) { log.Printf("Auth failed for user '%s': traffic limit exceeded", user); return false }
 			}
+			if acc.MaxSessions > 0 {
+				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
+				countPtr := v.(*int32)
+				if atomic.LoadInt32(countPtr) >= int32(acc.MaxSessions) {
+					log.Printf("Auth rejected for user '%s': max sessions would be exceeded", user)
+					return false
+				}
+			}
 			if password == acc.Password { return true }
 			log.Printf("Auth failed for user '%s': invalid credentials", user)
 			return false
 		},
-		ConnCallback: func(ctx ssh.Context, conn net.Conn) net.Conn {
-			user := ctx.User()
-			globalConfig.lock.RLock()
-			acc, _ := globalConfig.Accounts[user]
-			globalConfig.lock.RUnlock()
-
-			if acc.MaxSessions > 0 {
-				v, _ := userConnectionCount.LoadOrStore(user, new(int32))
-				countPtr := v.(*int32)
-				newCount := atomic.AddInt32(countPtr, 1) 
-				if newCount > int32(acc.MaxSessions) {
-					log.Printf("Auth success but connection denied for user '%s': max sessions exceeded (%d/%d)", user, newCount, acc.MaxSessions)
-					atomic.AddInt32(countPtr, -1)
-					// [FIX] 正确的关闭方式是直接关闭底层的 net.Conn
-					conn.Close()
-					return conn
-				}
-			}
-			
-			onlineUser := &OnlineUser{
-				ConnID:      ctx.SessionID(),
-				Username:    user,
-				RemoteAddr:  ctx.RemoteAddr().String(),
-				ConnectTime: time.Now(),
-				sshCtx:      ctx,
-				netConn:     conn, // 保存 net.Conn
-			}
-			onlineUsers.Store(onlineUser.ConnID, onlineUser)
-			log.Printf("User '%s' connected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
-
-			// [FIX] 使用 ctx.Done() 来管理连接的生命周期
-			go func() {
-				<-ctx.Done() // 阻塞直到连接关闭
-				if v, ok := userConnectionCount.Load(user); ok {
-					atomic.AddInt32(v.(*int32), -1)
-				}
-				onlineUsers.Delete(ctx.SessionID())
-				log.Printf("User '%s' disconnected from %s (SessionID: %s)", user, ctx.RemoteAddr(), ctx.SessionID())
-			}()
-
-			return conn
-		},
 		Handler: func(s ssh.Session) {
-			io.WriteString(s, "This is a tunnel-only server. No shell access is provided.\n")
+			user := s.User()
+			connID := s.Context().SessionID()
+
+			if val, ok := userConnectionCount.Load(user); ok {
+				atomic.AddInt32(val.(*int32), 1)
+			}
+			onlineUser := &OnlineUser{ConnID: connID, Username: user, RemoteAddr: s.RemoteAddr().String(), ConnectTime: time.Now(), sshSession: s}
+			onlineUsers.Store(onlineUser.ConnID, onlineUser)
+			log.Printf("Auth success for user '%s' from %s (SessionID: %s)", user, s.RemoteAddr(), connID)
+
+			defer func() {
+				if val, ok := userConnectionCount.Load(user); ok {
+					atomic.AddInt32(val.(*int32), -1)
+				}
+				onlineUsers.Delete(onlineUser.ConnID)
+				log.Printf("Session closed for user '%s' from %s (SessionID: %s)", user, s.RemoteAddr(), connID)
+			}()
+			
+			<-s.Context().Done()
 		},
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"session":      ssh.DefaultSessionHandler,
@@ -886,6 +905,8 @@ func main() {
 	signer, _ := gossh.NewSignerFromKey(priv)
 	server.AddHostKey(signer)
 	
+	// --- 启动监听器 ---
+
 	sshListener, err := net.Listen("tcp", globalConfig.ListenAddr)
 	if err != nil {
 		log.Fatalf("FATAL: Cannot listen on %s: %v", globalConfig.ListenAddr, err)
