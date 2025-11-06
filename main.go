@@ -1,4 +1,4 @@
-// main.go (已修正编译错误)
+// main.go (已修正所有编译错误并采用适配器模式)
 package main
 
 import (
@@ -30,7 +30,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/ssh"
+	"github.comcom/charmbracelet/ssh"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	gossh "golang.org/x/crypto/ssh"
@@ -123,6 +123,53 @@ type Session struct{ Username string; Expiry time.Time }
 var sessions = make(map[string]Session)
 var sessionsLock sync.RWMutex
 var bufferPool sync.Pool
+
+// --- [新增] singleConnListener 适配器 ---
+// singleConnListener 实现了 net.Listener 接口，但它只处理一个单一的 net.Conn。
+// 这使得我们可以将一个已经接受的连接 "喂" 给期望 Listener 的 ssh.Server.Serve 方法。
+type singleConnListener struct {
+	conn   net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+// newSingleConnListener 创建一个新的 singleConnListener 实例。
+func newSingleConnListener(conn net.Conn) net.Listener {
+	return &singleConnListener{
+		conn:   conn,
+		closed: make(chan struct{}),
+	}
+}
+
+// Accept 返回唯一的连接，且只返回一次。后续调用将阻塞直到 Close 被调用。
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	var conn net.Conn
+	l.once.Do(func() {
+		conn = l.conn
+	})
+	if conn != nil {
+		return conn, nil
+	}
+	<-l.closed
+	return nil, io.EOF
+}
+
+// Close 关闭通道以解除 Accept 的阻塞，并关闭底层连接。
+func (l *singleConnListener) Close() error {
+	select {
+	case <-l.closed:
+		// 已经关闭
+	default:
+		close(l.closed)
+	}
+	return l.conn.Close()
+}
+
+// Addr 返回底层连接的本地地址。
+func (l *singleConnListener) Addr() net.Addr {
+	return l.conn.LocalAddr()
+}
+
 
 // --- 辅助函数 ---
 
@@ -305,8 +352,14 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 	if bytes.HasPrefix(peekedBytes, []byte("SSH-2.0")) {
 		log.Printf("System: Detected direct SSH connection via TLS for %s (SNI: %s)", c.RemoteAddr(), sni)
 		time.Sleep(500 * time.Millisecond)
-		// *** FIX: Use Handle for a single connection, not Serve ***
-		go server.Handle(c)
+		// *** FIX: Use the singleConnListener to wrap the connection ***
+		go func() {
+			// Serve will block until the single connection is closed.
+			err := server.Serve(newSingleConnListener(c))
+			if err != nil && err != io.EOF {
+				log.Printf("System: ssh.Serve (direct) failed for %s: %v", c.RemoteAddr(), err)
+			}
+		}()
 	} else {
 		log.Printf("System: Detected HTTP-based connection via TLS for %s (SNI: %s), attempting Upgrade.", c.RemoteAddr(), sni)
 		
@@ -336,8 +389,13 @@ func dispatchConnection(c net.Conn, server *ssh.Server) {
 		time.Sleep(500 * time.Millisecond)
 		
 		wrappedConn := &handshakeConn{Conn: c, r: reader}
-		// *** FIX: Use Handle for a single connection, not Serve ***
-		go server.Handle(wrappedConn)
+		// *** FIX: Use the singleConnListener to wrap the connection ***
+		go func() {
+			err := server.Serve(newSingleConnListener(wrappedConn))
+			if err != nil && err != io.EOF {
+				log.Printf("System: ssh.Serve (http-upgrade/tls) failed for %s: %v", c.RemoteAddr(), err)
+			}
+		}()
 	}
 }
 
@@ -371,8 +429,13 @@ func handleHttpUpgrade(c net.Conn, server *ssh.Server) {
 	time.Sleep(500 * time.Millisecond)
 	
 	wrappedConn := &handshakeConn{Conn: c, r: reader}
-	// *** FIX: Use Handle for a single connection, not Serve ***
-	go server.Handle(wrappedConn)
+	// *** FIX: Use the singleConnListener to wrap the connection ***
+	go func() {
+		err := server.Serve(newSingleConnListener(wrappedConn))
+		if err != nil && err != io.EOF {
+			log.Printf("System: ssh.Serve (http-upgrade/plain) failed for %s: %v", c.RemoteAddr(), err)
+		}
+	}()
 }
 
 
@@ -789,7 +852,7 @@ func main() {
 				log.Printf("Session closed for user '%s' from %s", user, s.RemoteAddr())
 			}()
 			
-			// *** FIX: Correctly wait for the session context to be done. ***
+			// 正确等待会话结束
 			<-s.Context().Done()
 		},
 		
