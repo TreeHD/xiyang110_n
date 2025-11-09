@@ -1,4 +1,4 @@
-// main.go (最终完整版 - 集成所有功能和修正)
+// main.go (最终完整版 - 修正80端口卡顿问题)
 package main
 
 import (
@@ -561,6 +561,10 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 		}
 	}
 	
+	// >>>>>> 问题修正处 <<<<<<
+	// 清除为握手设置的读超时，以防它影响后续的SSH数据传输
+	c.SetReadDeadline(time.Time{})
+
 	time.Sleep(500 * time.Millisecond)
 	
 	var finalReader io.Reader
@@ -725,7 +729,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.Lock()
 		if globalConfig.AdminAccounts[user] == payload.OldPassword {
 			globalConfig.AdminAccounts[user] = payload.NewPassword
-			globalConfig.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
+			global.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 		} else { globalConfig.lock.Unlock(); sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"}) }
 	case r.URL.Path == "/api/settings":
 		if r.Method == "GET" { 
