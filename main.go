@@ -729,7 +729,7 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		globalConfig.lock.Lock()
 		if globalConfig.AdminAccounts[user] == payload.OldPassword {
 			globalConfig.AdminAccounts[user] = payload.NewPassword
-			global.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
+			globalConfig.lock.Unlock(); safeSaveConfig(); sendJSON(w, http.StatusOK, map[string]string{"message": "密码更新成功"})
 		} else { globalConfig.lock.Unlock(); sendJSON(w, http.StatusForbidden, map[string]string{"message": "旧密码错误"}) }
 	case r.URL.Path == "/api/settings":
 		if r.Method == "GET" { 
