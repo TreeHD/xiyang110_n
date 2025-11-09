@@ -1,4 +1,4 @@
-// main.go (最终完整版 - 修正80端口卡顿问题)
+// main.go (最终完整版 - 集成所有功能和修正)
 package main
 
 import (
@@ -561,10 +561,6 @@ func handleHttpUpgrade(c net.Conn, sshCfg *ssh.ServerConfig) {
 		}
 	}
 	
-	// >>>>>> 问题修正处 <<<<<<
-	// 清除为握手设置的读超时，以防它影响后续的SSH数据传输
-	c.SetReadDeadline(time.Time{})
-
 	time.Sleep(500 * time.Millisecond)
 	
 	var finalReader io.Reader
