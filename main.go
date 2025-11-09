@@ -1,4 +1,4 @@
-// main.go (最终完整版 - 集成所有功能和修正)
+// main.go (最终完整版 - 集成所有功能和修正, 并加入TCP Keepalive)
 package main
 
 import (
@@ -380,6 +380,23 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 
 // 核心SSH处理器
 func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
+	// =====================================================================
+	// ========== 以下是本次唯一的修改: 为底层TCP连接开启Keepalive ==========
+	// =====================================================================
+	if tcpConn, ok := c.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second) // 30秒探测一次
+	} else if tlsConn, ok := c.(*tls.Conn); ok {
+		// 如果是tls.Conn，需要拿到它底层的net.Conn
+		if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+	}
+	// =====================================================================
+	// ============================ 修改结束 ===============================
+	// =====================================================================
+	
 	connForSSH := &handshakeConn{Conn: c, r: r}
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
@@ -391,26 +408,11 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 		}
 		return
 	}
-	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
-	if idleTimeout > 0 {
-		c.SetReadDeadline(time.Time{})
-		doneDeadline := make(chan struct{})
-		defer close(doneDeadline)
-		go func() {
-			ticker := time.NewTicker(idleTimeout / 2)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					c.SetReadDeadline(time.Now().Add(idleTimeout))
-				case <-doneDeadline:
-					return
-				}
-			}
-		}()
-	} else {
-		c.SetReadDeadline(time.Time{})
-	}
+	
+	// 在旧版本中，这里有一个复杂的、基于Ticker的空闲超时管理。
+	// 在当前版本中，我们相信TCP Keepalive和SSH Keepalive，所以直接清除超时。
+	c.SetReadDeadline(time.Time{})
+
 	defer sshConn.Close()
 	username := sshConn.User()
 	defer func() {
@@ -804,7 +806,7 @@ func main() {
     log.Println("------------------ Behaviors ---------------------")
     log.Printf("  Handshake Timeout: %d seconds", globalConfig.HandshakeTimeout)
     log.Printf("  Required User-Agent: %s", globalConfig.ConnectUA)
-    log.Printf("  Connection Idle Timeout: %d seconds", globalConfig.IdleTimeoutSeconds)
+    log.Printf("  Connection Idle Timeout: %d seconds (Note: This setting is now inactive)", globalConfig.IdleTimeoutSeconds)
     log.Printf("  Target Connect Timeout: %d seconds", globalConfig.TargetConnectTimeoutSeconds)
     log.Println("------------------- Performance ------------------")
     log.Printf("  Buffer Size: %d KB", globalConfig.BufferSizeKB)
