@@ -1,4 +1,4 @@
-// main.go (最终完整版 - 集成所有功能和修正, 并加入TCP Keepalive)
+// main.go (最终完整版 - 集成所有功能和修正)
 package main
 
 import (
@@ -380,23 +380,6 @@ func sendKeepAlives(sshConn ssh.Conn, done <-chan struct{}) {
 
 // 核心SSH处理器
 func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
-	// =====================================================================
-	// ========== 以下是本次唯一的修改: 为底层TCP连接开启Keepalive ==========
-	// =====================================================================
-	if tcpConn, ok := c.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second) // 30秒探测一次
-	} else if tlsConn, ok := c.(*tls.Conn); ok {
-		// 如果是tls.Conn，需要拿到它底层的net.Conn
-		if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
-	}
-	// =====================================================================
-	// ============================ 修改结束 ===============================
-	// =====================================================================
-	
 	connForSSH := &handshakeConn{Conn: c, r: r}
 	c.SetReadDeadline(time.Now().Add(15 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(connForSSH, sshCfg)
@@ -408,11 +391,26 @@ func handleSshConnection(c net.Conn, r io.Reader, sshCfg *ssh.ServerConfig) {
 		}
 		return
 	}
-	
-	// 在旧版本中，这里有一个复杂的、基于Ticker的空闲超时管理。
-	// 在当前版本中，我们相信TCP Keepalive和SSH Keepalive，所以直接清除超时。
-	c.SetReadDeadline(time.Time{})
-
+	idleTimeout := time.Duration(globalConfig.IdleTimeoutSeconds) * time.Second
+	if idleTimeout > 0 {
+		c.SetReadDeadline(time.Time{})
+		doneDeadline := make(chan struct{})
+		defer close(doneDeadline)
+		go func() {
+			ticker := time.NewTicker(idleTimeout / 2)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					c.SetReadDeadline(time.Now().Add(idleTimeout))
+				case <-doneDeadline:
+					return
+				}
+			}
+		}()
+	} else {
+		c.SetReadDeadline(time.Time{})
+	}
 	defer sshConn.Close()
 	username := sshConn.User()
 	defer func() {
@@ -806,7 +804,7 @@ func main() {
     log.Println("------------------ Behaviors ---------------------")
     log.Printf("  Handshake Timeout: %d seconds", globalConfig.HandshakeTimeout)
     log.Printf("  Required User-Agent: %s", globalConfig.ConnectUA)
-    log.Printf("  Connection Idle Timeout: %d seconds (Note: This setting is now inactive)", globalConfig.IdleTimeoutSeconds)
+    log.Printf("  Connection Idle Timeout: %d seconds", globalConfig.IdleTimeoutSeconds)
     log.Printf("  Target Connect Timeout: %d seconds", globalConfig.TargetConnectTimeoutSeconds)
     log.Println("------------------- Performance ------------------")
     log.Printf("  Buffer Size: %d KB", globalConfig.BufferSizeKB)
@@ -887,6 +885,18 @@ func main() {
 			if string(p) == acc.Password { return nil, nil }
 			if acc.MaxSessions > 0 { if v, ok := userConnectionCount.Load(user); ok { atomic.AddInt32(v.(*int32), -1) } }
 			return nil, fmt.Errorf("invalid credentials")
+		},
+		Config: ssh.Config{
+			// 密钥交换(KEX)算法配置: 将最安全的抗量子算法放在首位
+			KeyExchanges: []string{
+				"mlkem768x25519-sha256",
+				"curve25519-sha256@libssh.org",
+				"ecdh-sha2-nistp256",
+			},
+			// 加密(Cipher)算法配置: 只保留对手机最优的ChaCha20，强制使用
+			Ciphers: []string{
+				"chacha20-poly1305@openssh.com",
+			},
 		},
 	}
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
