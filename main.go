@@ -886,18 +886,6 @@ func main() {
 			if acc.MaxSessions > 0 { if v, ok := userConnectionCount.Load(user); ok { atomic.AddInt32(v.(*int32), -1) } }
 			return nil, fmt.Errorf("invalid credentials")
 		},
-		Config: ssh.Config{
-			// 密钥交换(KEX)算法配置: 将最安全的抗量子算法放在首位
-			KeyExchanges: []string{
-				"mlkem768x25519-sha256",
-				"curve25519-sha256@libssh.org",
-				"ecdh-sha2-nistp256",
-			},
-			// 加密(Cipher)算法配置: 只保留对手机最优的ChaCha20，强制使用
-			Ciphers: []string{
-				"chacha20-poly1305@openssh.com",
-			},
-		},
 	}
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	key, _ := ssh.NewSignerFromKey(priv)
