@@ -8,23 +8,23 @@ RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o wstunnel-go
 
 # Stage 2: UDPGW Downloader (Multi-arch)
-FROM alpine:latest AS udpgw-downloader
+FROM debian:bookworm-slim AS udpgw-downloader
 ARG TARGETARCH
-RUN apk add --no-cache curl unzip
+RUN apt-get update && apt-get install -y curl unzip
 RUN set -x && \
     case "${TARGETARCH}" in \
         "amd64") ARCH="x86_64" ;; \
         "arm64") ARCH="aarch64" ;; \
         *) ARCH="x86_64" ;; \
     esac && \
-    URL="https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-${ARCH}-unknown-linux-musl.zip" && \
+    URL="https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-${ARCH}-unknown-linux-gnu.zip" && \
     curl -L -o udpgw.zip "$URL" && \
     unzip udpgw.zip udpgw-server && \
     chmod +x udpgw-server
 
 # Stage 3: Final Runner
-FROM alpine:latest
-RUN apk add --no-cache tzdata
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 # Copy binaries
