@@ -1,113 +1,75 @@
-🎉 发布正式版：wstunnel-go
+# wstunnel-go (免流代理伺服器)
 
-现正式发布 wstunnel-go 正式版 🚀
+這是一個基於 Go（Golang） 語言開發的代理工具，專門用於**流量卡免流**場景。支援多種連線方式與傳輸邏輯，兼顧效能、穩定性與部署便捷性，適用於多種複雜網路環境。
 
-项目基于 Go（Golang） 语言开发，对连接方式与传输逻辑进行了重构，兼顾性能、稳定性与部署便捷性，适用于多种复杂网络环境。
+## ✨ 專案特性
 
-✨ 项目特性
+*   **Go 語言編寫**：資源佔用極低，執行效能佳。
+*   **多模式支援**：支援 Direct, Direct TLS, HTTP Payload, SNI Fronted (TLS + HTTP Payload), SOCKS5 / HTTP Proxy 等模式。
+*   **開箱即用**：提供 Docker Compose 部署方式，免編譯、免繁雜設定。
+*   **跨平臺**：結合 GitHub Actions 提供預先建置的 Docker 映像檔 (`ghcr.io`)，支援多種系統和架構部署。
 
-✅ Go 语言编写，单文件编译，跨平台运行
+## 🚀 快速部署 (Docker Compose)
 
-✅ 启动快、资源占用低
+我們推薦使用 Docker Compose 進行部署，以確保環境乾淨與後續維護的便利性。
 
-✅ 适合长期运行与服务端部署
+### 1. 下載並執行 `docker-compose.yml`
 
-🔧 已支持模式
+在您的伺服器上建立一個新資料夾並寫入 `docker-compose.yml` 檔案 (請將 `<您的GitHub帳號/專案名稱>` 替換為實際的路徑，例如 `treehd/xiyang110_n`):
 
-Direct
+```yaml
+services:
+  wstunnel:
+    image: ghcr.io/treehd/xiyang110_n:latest
+    container_name: wstunnel
+    restart: always
+    ports:
+      - "80:80"       # HTTP Proxy (免流入口)
+      - "443:443"     # TLS Multiplexer (加密入口)
+      - "9090:9090"   # 管理後台
+      - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
+    volumes:
+      # 持久化資料夾: 所有帳號設定與流量紀錄都會儲存在此資料夾內
+      - ./data:/app/data
+```
 
-Direct TLS
+執行以下命令啟動：
 
-HTTP Payload
+```bash
+docker-compose up -d
+```
 
-SNI Fronted（TLS + HTTP Payload）
+啟動後，你可以透過以下網址存取管理後台：
+`http://<您的伺服器IP>:9090/login.html` 
 
-可灵活应对直连、TLS 加密以及基于 SNI 的前置与中转场景。
+**初始設定與持久化：**
+第一次啟動後，系統會自動在同一個資料夾內生成 `./data/config.json` 與 `./data/traffic.json`。
+請打開 `data/config.json` 修改您的預設管理員帳號(`admin_accounts`)與一般使用者帳號密碼，以確保安全性！後續所有在網頁後台進行的修改，都會即時且永久地寫入這個 `data/` 資料夾，完全不受 Docker 重啟影響。
 
-📦 版本状态
+## 🛠 進階：自行編譯 (不推薦，建議使用 Docker)
 
-当前版本：正式版（Stable Release）
+如果您真的需要直接在本地編譯執行，請確保安裝了 Go 1.24+：
 
-已可用于实际环境部署
+```bash
+go mod tidy
+go build -ldflags "-s -w" -o wstunnel-go
+./wstunnel-go
+```
 
-🔗 项目地址
+## 代理功能指南 (SOCKS5 / HTTP Proxy)
+啟動專案後，您能透過 預設的 `1080` 埠口連線至本服務，享受完整的代理上網經驗。
+- **支援協定**：SOCKS5 與 HTTP (皆支援 Auth 驗證與 CONNECT 方法)
+- **認證方式**：請使用 `data/config.json` 裡設定的 `accounts` 作為連線的帳號與密碼。您可以打開管理後台 `9090` 即時新增修改。
+- **流量計算**：您在 Proxy 所消耗的所有傳輸量，皆會同步統計至 `traffic.json`，支援後台限流機制。
 
-GitHub：
-https://github.com/xiaoguiday/xiyang110
+測試指令（請替換伺服器IP與帳號密碼）：
+```bash
+# 測試 HTTP Basic Auth 代理
+curl -x http://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
+# 測試 SOCKS5 代理
+curl -x socks5://帳號:密碼@您的伺服器IP:1080 http://ipinfo.io
+```
 
-欢迎测试、反馈问题与提交建议，一起完善项目 🙌
-=======================
+---
 
-编译好的X86架构版本已经打包,打包里面包含了我原服务器的数据,你们自己删除,默认面板账号密码admin:@@123123@@
-
-安装教程1
-
-WSTunnel + UdpGw 部署说明文档
-方案一：标准化一键安装（推荐）
-此方案直接将文件放置在系统预期的 /usr/local/bin 目录中，无需修改服务文件，稳定性最高。
-
-使用方法：
-将 111.zip 上传到服务器 root 目录。
-复制下方脚本，保存为 install.sh。
-执行 bash install.sh。
- 复制代码 隐藏代码
-#!/bin/bash
-
-# WSTunnel 一键部署脚本
-echo "开始部署 WSTunnel + UdpGw..."
-
-# 1. 基础准备
-apt update && apt install -y unzip
-mkdir -p ~/111_temp
-unzip -o 111.zip -d ~/111_temp
-cd ~/111_temp
-
-# 2. 移动文件到标准路径 (消除路径修正需求)
-chmod +x wstunnel-go badvpn-udpgw
-cp wstunnel-go badvpn-udpgw config.json admin.html login.html traffic.json /usr/local/bin/
-
-# 3. 部署服务文件
-if [ -f "wstunnel.service" ] && [ -f "udpgw.service" ]; then
-    cp *.service /etc/systemd/system/
-else
-    echo "错误：未在压缩包内找到 .service 文件"
-    exit 1
-fi
-
-# 4. 启动服务
-systemctl daemon-reload
-systemctl enable --now wstunnel.service udpgw.service
-
-echo "------------------------------------------------"
-echo "部署完成！"
-echo "管理面板: http://$(curl -s ifconfig.me):9090/login.html"
-echo "默认账号: admin"
-echo "默认密码: @@123123@@"
-echo "------------------------------------------------"
-安装教程2
-
-WSTunnel + UdpGw 标准化部署指南（推荐方案）
-本方案直接将文件部署至系统默认的路径 /usr/local/bin，以匹配 .service 文件的默认配置。
-
-1. 环境准备
- 复制代码 隐藏代码
-apt update && apt install -y unzip
-unzip 111.zip -d ~/111
-cd ~/111
-2. 一步到位部署（无需修正路径）
-直接将所有文件移动到服务文件预期的 /usr/local/bin 路径下：
-
- 复制代码 隐藏代码
-# 1. 赋予执行权限
-chmod +x wstunnel-go badvpn-udpgw
-
-# 2. 直接分发到系统预设位置
-# 程序、配置、网页模板必须放在一起，以确保面板能正常加载
-cp wstunnel-go badvpn-udpgw config.json admin.html login.html traffic.json /usr/local/bin/
-
-# 3. 部署服务文件
-cp *.service /etc/systemd/system/
-3. 启动服务
- 复制代码 隐藏代码
-systemctl daemon-reload
-systemctl enable --now wstunnel.service udpgw.service
+歡迎測試、回饋問題與提交建議，一起完善專案 🙌

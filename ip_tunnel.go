@@ -7,7 +7,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com.songgao/water"
+	"github.com/songgao/water"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -24,7 +24,6 @@ func createTunDevice() error {
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
-	config.Name = ifaceName
 
 	// [重要] 删除所有关于 Pi = false 的设置，使用库的默认行为
 	// water 库会为我们处理好一切
@@ -66,7 +65,9 @@ func handleIPTunnel(ch ssh.Channel, remoteAddr net.Addr) {
 	session := &clientSession{packetChan: packetChan}
 	var clientTunIP string
 	defer func() {
-		sessionManager.Unregister(clientTunIP)
+		if clientTunIP != "" {
+			sessionManager.Unregister(clientTunIP)
+		}
 	}()
 
 	done := make(chan struct{})

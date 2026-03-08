@@ -1,0 +1,15 @@
+services:
+  wstunnel:
+    image: ghcr.io/treehd/xiyang110_n:latest
+    container_name: wstunnel
+    restart: always
+    ports:
+      - "80:80"       # HTTP Proxy (免流入口)
+      - "443:443"     # TLS Multiplexer (加密入口)
+      - "9090:9090"   # 管理後台
+      - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
+      - "7300:7300"   # UDPGW (UDP Gateway)
+    volumes:
+      # 持久化資料夾: 所有帳號設定與流量紀錄都會儲存在此資料夾內。
+      # 第一次啟動時會自動產生預設的 config.json，請由此修改您的初始密碼與帳號設定。
+      - ./data:/app/data
