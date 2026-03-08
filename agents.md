@@ -8,8 +8,9 @@
 * **核心檔案配置**： 
   * `main.go`: 程式進入點、設定 `config.json` 解析、路由分配中心 (包含 80 HTTP Upgrade 與 443 TLS Multiplexer)。
   * `proxy_server.go`: SOCKS5 與 HTTP Proxy 的雙協定處理器。
-  * `ip_tunnel.go` / `udpgw_handler.go` / `udp_fullcone.go`: 用於處理 VPN/TUN 封包轉發與 UDP 代理的檔案。
+  * `entrypoint.sh`: Docker 入口腳本，負責同時啟動 `udpgw-server` (port 7300) 與主程式 `wstunnel-go`。
   * `frontend/`: 存放控制面板的網頁前端 (HTML)。
+* **UDP 支援 (UDPGW)**：已捨棄舊有的 Go 實作 (`udpgw_handler.go` 等)，改採 `tun2proxy` 專案的 `udpgw-server`。這是在 Dockerfile 中根據架構下載對應的 musl 二進位檔，並在背景獨立運行。
 * **流量統計**：所有傳輸流量（包含 SSH Forwarding 與 SOCKS5/HTTP Proxy）都會統計進 `globalTraffic` 這個 goroutine-safe 的 `sync.Map` 中，並且會由背景常式定期存入 `traffic.json` 以達永久保存。
 * **Port 複用 (Port Multiplexing)**：`443` 埠口不只是單純的 HTTPS，裡面做了一層 Peek 來判斷進來的是 SSH Payload、單純的 TLS HTTP 還是其他偽裝流量。**在修改這一塊時請特別注意不要破壞原有的 Peek 邏輯。**
 
@@ -39,10 +40,11 @@ go build -ldflags "-s -w" -o wstunnel-go
 2. **流量統計**：任何代理功能只要消耗了流量，都應該透過 `atomic.AddUint64(&traffic.Sent, bytes)` 與 `atomic.AddUint64(&traffic.Received, bytes)` 把流量加入 `globalTraffic` 中。
 3. **優雅關閉 (Graceful Shutdown)**：我們在 `main.go` 有捕捉 `syscall.SIGINT` 與 `syscall.SIGTERM`，如果要起新的 Server 常駐邏輯（像是 Proxy），記得要加入 `sync.WaitGroup` 並在結束前優雅釋放資源與存檔。
 
-## 3. Docker 化部署
-我們已將建置與發布的流程自動化於 `.github/workflows/docker-publish.yml` 中：
-* 當有 push event 到 `main` 分支時，GitHub Action 會自動啟動。
-* 使用 `setup-qemu-action` 同時將 `linux/amd64` 與 `linux/arm64` 雙架構打包並推送到 `ghcr.io`。
-* 使用者只需修改 `config.json` 並且跑 `docker-compose up -d` 即可。**不要讓使用者在本機跑 go build。**
+## 3. Docker 化部署與多架構
+我們使用 Docker 的多階段建置 (Multi-stage build)：
+1. `go-builder`: 編譯 Go 程式。
+2. `udpgw-downloader`: 根據 `TARGETARCH` (amd64/arm64) 從 GitHub 下載對應的 `tun2proxy` 專案 `udpgw-server` musl 二進位檔。
+3. `runner`: 最終運行的 Alpine 鏡像，包含所有二進位檔與 `entrypoint.sh`。
+* 當有 push event 到 `main` 分支時，GitHub Action 會自動啟動並推送雙架構鏡像至 `ghcr.io`。
 
 -- 祝你開發順利！

@@ -28,6 +28,7 @@ services:
       - "443:443"     # TLS Multiplexer (加密入口)
       - "9090:9090"   # 管理後台
       - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
+      - "7300:7300/udp" # UDPGW (手遊/語音加速入口)
     volumes:
       # 持久化資料夾: 所有帳號設定與流量紀錄都會儲存在此資料夾內
       - ./data:/app/data
@@ -39,12 +40,19 @@ services:
 docker-compose up -d
 ```
 
-啟動後，你可以透過以下網址存取管理後台：
+啟動後，你可以透過以下網址存取管理控制台：
 `http://<您的伺服器IP>:9090/login.html` 
 
-**初始設定與持久化：**
-第一次啟動後，系統會自動在同一個資料夾內生成 `./data/config.json` 與 `./data/traffic.json`。
-請打開 `data/config.json` 修改您的預設管理員帳號(`admin_accounts`)與一般使用者帳號密碼，以確保安全性！後續所有在網頁後台進行的修改，都會即時且永久地寫入這個 `data/` 資料夾，完全不受 Docker 重啟影響。
+**🔑 初始登入資訊：**
+- **帳號**：`admin`
+- **密碼**：系統於**第一次啟動**時會隨機產生 16 位數密碼，請查看 Docker Log 獲取：
+  ```bash
+  docker logs wstunnel | grep "密碼:"
+  ```
+
+**📦 持久化與設定：**
+第一次啟動後，系統會自動在 `./data` 資料夾內生成 `config.json` 與 `traffic.json`。
+後台所有的修改（新增帳號、限流設定、SNI 白名單等）都會即時寫入 `data/` 資料夾，升級或重啟 Docker 都不會導致資料遺失。
 
 ## 🛠 進階：自行編譯 (不推薦，建議使用 Docker)
 
