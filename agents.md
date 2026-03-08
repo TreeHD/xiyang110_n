@@ -10,7 +10,7 @@
   * `proxy_server.go`: SOCKS5 與 HTTP Proxy 的雙協定處理器。
   * `entrypoint.sh`: Docker 入口腳本，負責同時啟動 `udpgw-server` (port 7300) 與主程式 `wstunnel-go`。
   * `frontend/`: 存放控制面板的網頁前端 (HTML)。
-* **UDP 支援 (UDPGW)**：已捨棄舊有的 Go 實作 (`udpgw_handler.go` 等)，改採 `tun2proxy` 專案的 `udpgw-server`。這是在 Dockerfile 中根據架構下載對應的 musl 二進位檔，並在背景獨立運行。
+* **UDP 支援 (UDPGW)**：已捨棄舊有的 Go 實作 (`udpgw_handler.go` 等)，改採 `tun2proxy` 專案的 `udpgw-server`。這是在 Dockerfile 中根據架構下載對應的 gnu 二進位檔，並在基於 Debian 的容器中運行以確保 glibc 相容性。
 * **流量統計**：所有傳輸流量（包含 SSH Forwarding 與 SOCKS5/HTTP Proxy）都會統計進 `globalTraffic` 這個 goroutine-safe 的 `sync.Map` 中，並且會由背景常式定期存入 `traffic.json` 以達永久保存。
 * **Port 複用 (Port Multiplexing)**：`443` 埠口不只是單純的 HTTPS，裡面做了一層 Peek 來判斷進來的是 SSH Payload、單純的 TLS HTTP 還是其他偽裝流量。**在修改這一塊時請特別注意不要破壞原有的 Peek 邏輯。**
 
@@ -42,9 +42,9 @@ go build -ldflags "-s -w" -o wstunnel-go
 
 ## 3. Docker 化部署與多架構
 我們使用 Docker 的多階段建置 (Multi-stage build)：
-1. `go-builder`: 編譯 Go 程式。
-2. `udpgw-downloader`: 根據 `TARGETARCH` (amd64/arm64) 從 GitHub 下載對應的 `tun2proxy` 專案 `udpgw-server` musl 二進位檔。
-3. `runner`: 最終運行的 Alpine 鏡像，包含所有二進位檔與 `entrypoint.sh`。
+1. `go-builder`: 編譯 Go 程式 (Alpine)。
+2. `udpgw-downloader`: 根據 `TARGETARCH` (amd64/arm64) 下載對應的 `tun2proxy` 專案 `udpgw-server` **gnu** 二進位檔。
+3. `runner`: 最終運行的 **Debian** 鏡像，包含所有二進位檔與 `entrypoint.sh`。
 * 當有 push event 到 `main` 分支時，GitHub Action 會自動啟動並推送雙架構鏡像至 `ghcr.io`。
 
 -- 祝你開發順利！
