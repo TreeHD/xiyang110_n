@@ -9,7 +9,16 @@ services:
       - "9090:9090"   # 管理後台
       - "1080:1080"   # SOCKS5 / HTTP Proxy 入口
       - "7300:7300"   # UDPGW (UDP Gateway)
+      - "53:53/udp"   # DNSTT DNS 隧道入口 (需搭配 DNSTT_DOMAIN)
+    # iptables 需要 NET_ADMIN 權限 (用於 DNSTT 的 UDP 53→5300 轉發)
+    cap_add:
+      - NET_ADMIN
+    environment:
+      # [選填] DNS 隧道域名。設定後容器會自動啟動 dnstt-server。
+      # 須先在域名註冊商設定好 NS + A 記錄，詳見 README.md。
+      # 範例: t.example.com
+      - DNSTT_DOMAIN=
     volumes:
-      # 持久化資料夾: 所有帳號設定與流量紀錄都會儲存在此資料夾內。
+      # 持久化資料夾: 所有帳號設定、流量紀錄、DNSTT 金鑰都會儲存在此。
       # 第一次啟動時會自動產生預設的 config.json，請由此修改您的初始密碼與帳號設定。
       - ./data:/app/data

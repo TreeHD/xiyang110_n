@@ -8,11 +8,13 @@
 * **核心檔案配置**： 
   * `main.go`: 程式進入點、設定 `config.json` 解析、路由分配中心 (包含 80 HTTP Upgrade 與 443 TLS Multiplexer)。
   * `proxy_server.go`: SOCKS5 與 HTTP Proxy 的雙協定處理器。
-  * `entrypoint.sh`: Docker 入口腳本，負責同時啟動 `udpgw-server` (port 7300) 與主程式 `wstunnel-go`。
+  * `entrypoint.sh`: Docker 入口腳本，負責啟動 `udpgw` (port 7300)、`dnstt-server` (條件式) 與主程式 `wstunnel-go`。
   * `frontend/`: 存放控制面板的網頁前端 (HTML)。
-* **UDP 支援 (UDPGW)**：已捨棄舊有的 Go 實作 (`udpgw_handler.go` 等)，改採 `tun2proxy` 專案的 `udpgw-server`。這是在 Dockerfile 中根據架構下載對應的 gnu 二進位檔，並在基於 Debian 的容器中運行以確保 glibc 相容性。
+* **UDP 支援 (UDPGW)**：採用 `tun2proxy` 專案的 `udpgw-server`，在 Dockerfile 中根據架構下載 gnu 二進位檔。
+* **DNS 隧道 (DNSTT)**：內建 [dnstt-server](https://www.bamsoftware.com/software/dnstt/) 支援。透過環境變數 `DNSTT_DOMAIN` 條件啟動，金鑰自動生成並持久化於 `data/dnstt/`。隧道流量轉發至 `127.0.0.1:80` (HTTP Upgrade 入口)。
 * **流量統計**：所有傳輸流量（包含 SSH Forwarding 與 SOCKS5/HTTP Proxy）都會統計進 `globalTraffic` 這個 goroutine-safe 的 `sync.Map` 中，並且會由背景常式定期存入 `traffic.json` 以達永久保存。
 * **Port 複用 (Port Multiplexing)**：`443` 埠口不只是單純的 HTTPS，裡面做了一層 Peek 來判斷進來的是 SSH Payload、單純的 TLS HTTP 還是其他偽裝流量。**在修改這一塊時請特別注意不要破壞原有的 Peek 邏輯。**
+
 
 ## 2. 開發習慣與指導原則
 
